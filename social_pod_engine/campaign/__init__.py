@@ -1,6 +1,21 @@
-"""Pure campaign targeting and assignment planning; it never executes social actions."""
+"""Campaign planning and safe, dry-run execution intent management."""
 
-from .models import AssignmentPlan, AssignmentStatus, PlannedAssignment
+from .models import (
+    ApprovalStatus,
+    AssignmentPlan,
+    AssignmentStatus,
+    ExecutionTask,
+    PlannedAssignment,
+    TaskStatus,
+)
 from .planner import CampaignPlannerService
 
-__all__ = ["AssignmentPlan", "AssignmentStatus", "CampaignPlannerService", "PlannedAssignment"]
+__all__ = [
+    "ApprovalStatus",
+    "AssignmentPlan",
+    "AssignmentStatus",
+    "CampaignPlannerService",
+    "ExecutionTask",
+    "PlannedAssignment",
+    "TaskStatus",
+]

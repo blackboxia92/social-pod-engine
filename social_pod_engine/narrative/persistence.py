@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, select
+from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, inspect, select, text
 
 from ..campaign.models import AssignmentPlan, AssignmentStatus, PlannedAssignment
 from ..domain import SocialPlatform
@@ -70,6 +70,7 @@ _plan_items = Table(
     "assignment_plan_items",
     _metadata,
     Column("id", String(36), primary_key=True),
+    Column("assignment_id", String(36), nullable=True, unique=True),
     Column("plan_id", String(36), nullable=False, index=True),
     Column("account_id", String(36), nullable=False),
     Column("account_group_id", String(36), nullable=False),
@@ -88,6 +89,10 @@ class NarrativeCampaignStore:
 
     def initialize(self) -> None:
         _metadata.create_all(self.database.engine)
+        columns = {column["name"] for column in inspect(self.database.engine).get_columns("assignment_plan_items")}
+        if "assignment_id" not in columns:
+            with self.database.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE assignment_plan_items ADD COLUMN assignment_id VARCHAR(36)"))
 
     def save_campaign(self, campaign: Campaign) -> Campaign:
         self.initialize()
@@ -188,6 +193,7 @@ class NarrativeCampaignStore:
                 connection.execute(
                     _plan_items.insert().values(
                         id=f"{plan.id}:{index}",
+                        assignment_id=str(item.id),
                         plan_id=str(plan.id),
                         account_id=str(item.account_id),
                         account_group_id=str(item.account_group_id),
@@ -215,6 +221,15 @@ class NarrativeCampaignStore:
             created_at=_restore_datetime(row.created_at),
             assignments=assignments,
         )
+
+    def get_assignment(self, assignment_id: UUID) -> PlannedAssignment | None:
+        """Resolve an assignment independently of its parent plan for the execution bridge."""
+        self.initialize()
+        with self.database.engine.connect() as connection:
+            row = connection.execute(
+                select(_plan_items).where(_plan_items.c.assignment_id == str(assignment_id))
+            ).one_or_none()
+        return _assignment_from_row(row) if row is not None else None
 
     def _require_campaign(self, campaign_id: UUID) -> None:
         if self.get_campaign(campaign_id) is None:
@@ -279,6 +294,7 @@ def _policy_from_row(row: Any) -> EditorialPolicy:
 
 def _assignment_from_row(row: Any) -> PlannedAssignment:
     return PlannedAssignment(
+        id=UUID(str(row.assignment_id)) if row.assignment_id else uuid5(NAMESPACE_URL, str(row.id)),
         account_id=UUID(str(row.account_id)),
         account_group_id=UUID(str(row.account_group_id)),
         brief_id=UUID(str(row.brief_id)),

@@ -88,6 +88,16 @@ def normalize_editorial_role(role: str | None) -> str | None:
     return value or None
 
 
+def normalize_account_username(value: str) -> str:
+    """Canonical account identifier used by the first supported platforms."""
+    if not isinstance(value, str):
+        raise TypeError("username must be a string")
+    normalized = value.strip().lstrip("@").replace(" ", "").lower()
+    if not normalized:
+        raise ValueError("SocialAccount.username is required")
+    return normalized
+
+
 def normalize_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Copy JSON-safe contextual metadata while rejecting obvious secret fields."""
     copied = dict(metadata)
@@ -150,6 +160,7 @@ class SocialAccount:
     proxy_id: str | None = None
     group_id: UUID | str | None = None
     tags: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     editorial_role: str | None = None
     health_status: HealthStatus = HealthStatus.UNAVAILABLE
     session_status: SessionStatus = SessionStatus.UNKNOWN
@@ -160,13 +171,12 @@ class SocialAccount:
 
     def __post_init__(self) -> None:
         self.platform = SocialPlatform(self.platform)
-        self.username = self.username.strip()
-        if not self.username:
-            raise ValueError("SocialAccount.username is required")
+        self.username = normalize_account_username(self.username)
         self.upstream_profile_id = _normalize_optional_text(self.upstream_profile_id)
         self.proxy_id = _normalize_optional_text(self.proxy_id)
         self.group_id = _normalize_group_id(self.group_id)
         self.tags = normalize_tags(self.tags)
+        self.metadata = normalize_metadata(self.metadata)
         self.editorial_role = normalize_editorial_role(self.editorial_role)
         self.health_status = HealthStatus(self.health_status)
         self.session_status = SessionStatus(self.session_status)

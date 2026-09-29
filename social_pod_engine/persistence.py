@@ -9,7 +9,17 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, create_engine, event, select
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    String,
+    create_engine,
+    event,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .domain import (
@@ -21,6 +31,7 @@ from .domain import (
     SessionStatus,
     SocialAccount,
     SocialPlatform,
+    normalize_account_username,
 )
 
 
@@ -60,6 +71,7 @@ class SocialAccountSchema(SocialPodORMBase):
     group_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     group_id_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
     tags: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    metadata_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False)
     editorial_role: Mapped[str | None] = mapped_column(String(255), nullable=True)
     health_status: Mapped[str] = mapped_column(String(32), nullable=False)
     session_status: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -89,6 +101,7 @@ class SocialPodDatabase:
 
     def initialize(self) -> None:
         SocialPodORMBase.metadata.create_all(self.engine)
+        self._migrate_social_account_metadata()
 
     def close(self) -> None:
         self.engine.dispose()
@@ -114,6 +127,11 @@ class SocialPodDatabase:
             row = session.get(PersonaSchema, str(persona_id))
             return _persona_from_schema(row) if row else None
 
+    def find_persona_by_alias(self, alias: str) -> Persona | None:
+        with self._session() as session:
+            row = session.scalar(select(PersonaSchema).where(PersonaSchema.alias == alias.strip()))
+            return _persona_from_schema(row) if row else None
+
     def save_account_group(self, group: AccountGroup) -> AccountGroup:
         with self._session() as session:
             row = session.get(AccountGroupSchema, str(group.id))
@@ -130,6 +148,11 @@ class SocialPodDatabase:
             row = session.get(AccountGroupSchema, str(group_id))
             return _group_from_schema(row) if row else None
 
+    def find_group_by_alias(self, alias: str) -> AccountGroup | None:
+        with self._session() as session:
+            row = session.scalar(select(AccountGroupSchema).where(AccountGroupSchema.alias == alias.strip()))
+            return _group_from_schema(row) if row else None
+
     def save_social_account(self, account: SocialAccount) -> SocialAccount:
         with self._session() as session:
             row = session.get(SocialAccountSchema, str(account.id))
@@ -144,6 +167,20 @@ class SocialPodDatabase:
             row = session.get(SocialAccountSchema, str(account_id))
             return _account_from_schema(row) if row else None
 
+    def find_account_by_platform_username(
+        self, platform: SocialPlatform, username: str
+    ) -> SocialAccount | None:
+        """Find by the control-plane identity key, not an upstream profile id."""
+        normalized = normalize_account_username(username)
+        with self._session() as session:
+            rows = session.scalars(
+                select(SocialAccountSchema).where(SocialAccountSchema.platform == platform.value)
+            ).all()
+            for row in rows:
+                if normalize_account_username(row.username) == normalized:
+                    return _account_from_schema(row)
+        return None
+
     def list_social_accounts(self, persona_id: UUID) -> list[SocialAccount]:
         with self._session() as session:
             rows = session.scalars(
@@ -152,6 +189,15 @@ class SocialPodDatabase:
                 .order_by(SocialAccountSchema.created_at)
             ).all()
             return [_account_from_schema(row) for row in rows]
+
+    def _migrate_social_account_metadata(self) -> None:
+        """Add Phase 2 account metadata without affecting any upstream schema."""
+        columns = {column["name"] for column in inspect(self.engine).get_columns("social_accounts")}
+        if "metadata" not in columns:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    text("ALTER TABLE social_accounts ADD COLUMN metadata JSON NOT NULL DEFAULT '{}'"),
+                )
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _: Any) -> None:
@@ -187,6 +233,7 @@ def _apply_account_to_schema(account: SocialAccount, row: SocialAccountSchema) -
     row.group_id = str(account.group_id) if account.group_id is not None else None
     row.group_id_kind = "uuid" if isinstance(account.group_id, UUID) else "str" if account.group_id else None
     row.tags = list(account.tags)
+    row.metadata_payload = dict(account.metadata)
     row.editorial_role = account.editorial_role
     row.health_status = account.health_status.value
     row.session_status = account.session_status.value
@@ -209,6 +256,7 @@ def _account_from_schema(row: SocialAccountSchema) -> SocialAccount:
         proxy_id=row.proxy_id,
         group_id=group_id,
         tags=list(row.tags),
+        metadata=dict(row.metadata_payload),
         editorial_role=row.editorial_role,
         health_status=HealthStatus(row.health_status),
         session_status=SessionStatus(row.session_status),

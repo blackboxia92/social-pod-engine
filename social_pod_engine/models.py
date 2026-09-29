@@ -1,10 +1,14 @@
 """Platform-neutral values owned by Social Pod Engine, not by CPM."""
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 
 
-class SessionState(StrEnum):
+class StringEnum(str, Enum):
+    """Python 3.10-compatible string enum base for public values."""
+
+
+class SessionState(StringEnum):
     """A conservative reading of a page's account state."""
 
     ACTIVE = "active"

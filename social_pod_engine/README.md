@@ -15,6 +15,21 @@ The caller obtains and owns a browser page using CPM's existing lifecycle, then
 passes that page to an adapter. No adapter opens, closes, or persists a CPM
 profile. This keeps upgrades and upstream test results independent.
 
+## Domain and storage (Phase 1)
+
+The control plane owns `Persona`, `SocialAccount`, and a minimal
+`AccountGroup` anchor. A social account stores CPM's profile only as the opaque
+`upstream_profile_id`; there are no cross-database joins or foreign keys.
+
+`SocialPodDatabase` uses its own SQLite file at
+`social_pod_engine/data/social_pod.sqlite3` by default. Its SQLAlchemy schema
+uses portable JSON columns for `metadata` and normalized `tags`, so a future
+PostgreSQL migration is contained in this package.
+
+The four independent account dimensions are `health_status`, `session_status`,
+`lifecycle_status`, and `quota_status`. They are intentionally not collapsed
+into one global state.
+
 ## Included adapters
 
 - `x`: implemented read-only session health and profile-handle extraction.
@@ -34,5 +49,6 @@ Run independently from the unchanged upstream suite:
 ```powershell
 $env:PYTHONPATH = "$PWD\src"
 python -m pytest tests -m "not browser"              # upstream
-python -m pytest social_pod_engine_tests              # this extension
+python -m pytest social_pod_engine/tests               # Phase 1 extension
+python -m pytest social_pod_engine_tests               # legacy extension checks
 ```

@@ -1,19 +1,19 @@
 """Explicit adapter registration with no plugin auto-discovery side effects."""
 
-from .contracts import SocialPlatformAdapter
+from .adapters.base import BaseSocialAdapter
 
 
 class AdapterRegistry:
     def __init__(self) -> None:
-        self._adapters: dict[str, SocialPlatformAdapter] = {}
+        self._adapters: dict[str, BaseSocialAdapter] = {}
 
-    def register(self, adapter: SocialPlatformAdapter) -> None:
-        platform_id = adapter.platform_id.lower()
+    def register(self, adapter: BaseSocialAdapter) -> None:
+        platform_id = adapter.platform_name.lower()
         if platform_id in self._adapters:
             raise ValueError(f"Adapter already registered: {platform_id}")
         self._adapters[platform_id] = adapter
 
-    def get(self, platform_id: str) -> SocialPlatformAdapter:
+    def get(self, platform_id: str) -> BaseSocialAdapter:
         try:
             return self._adapters[platform_id.lower()]
         except KeyError as exc:

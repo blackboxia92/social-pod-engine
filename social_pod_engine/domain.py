@@ -48,6 +48,17 @@ class QuotaStatus(StringEnum):
     EXHAUSTED = "exhausted"
 
 
+class HealthIssueType(StringEnum):
+    SESSION_EXPIRED = "session_expired"
+    CHALLENGE_REQUIRED = "challenge_required"
+    SESSION_INVALID = "session_invalid"
+    PROXY_UNAVAILABLE = "proxy_unavailable"
+    PROXY_DEGRADED = "proxy_degraded"
+    PLATFORM_UNAVAILABLE = "platform_unavailable"
+    ACCOUNT_RESTRICTED = "account_restricted"
+    UNKNOWN = "unknown"
+
+
 _SENSITIVE_METADATA_KEYS = {
     "api_key",
     "credential",
@@ -166,6 +177,13 @@ class SocialAccount:
     session_status: SessionStatus = SessionStatus.UNKNOWN
     lifecycle_status: LifecycleStatus = LifecycleStatus.PENDING_SETUP
     quota_status: QuotaStatus = QuotaStatus.AVAILABLE
+    quarantined: bool = False
+    quarantine_reason: str | None = None
+    quarantine_issue_type: HealthIssueType | None = None
+    quarantined_at: datetime | None = None
+    healthy_check_streak: int = 0
+    last_healthcheck_at: datetime | None = None
+    next_healthcheck_at: datetime | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 
@@ -182,6 +200,21 @@ class SocialAccount:
         self.session_status = SessionStatus(self.session_status)
         self.lifecycle_status = LifecycleStatus(self.lifecycle_status)
         self.quota_status = QuotaStatus(self.quota_status)
+        self.quarantined = bool(self.quarantined)
+        self.quarantine_reason = _normalize_optional_text(self.quarantine_reason)
+        self.quarantine_issue_type = (
+            HealthIssueType(self.quarantine_issue_type) if self.quarantine_issue_type is not None else None
+        )
+        self.quarantined_at = _normalize_optional_datetime(self.quarantined_at)
+        if self.healthy_check_streak < 0:
+            raise ValueError("healthy_check_streak must be non-negative")
+        self.last_healthcheck_at = _normalize_optional_datetime(self.last_healthcheck_at)
+        self.next_healthcheck_at = _normalize_optional_datetime(self.next_healthcheck_at)
+        if not self.quarantined:
+            self.quarantine_reason = None
+            self.quarantine_issue_type = None
+            self.quarantined_at = None
+            self.healthy_check_streak = 0
         self.created_at = _normalize_datetime(self.created_at)
         self.updated_at = _normalize_datetime(self.updated_at)
 
@@ -200,3 +233,7 @@ def _normalize_group_id(value: UUID | str | None) -> UUID | str | None:
     if not isinstance(value, str):
         raise TypeError("group_id must be UUID, string, or None")
     return value.strip() or None
+
+
+def _normalize_optional_datetime(value: datetime | None) -> datetime | None:
+    return _normalize_datetime(value) if value is not None else None

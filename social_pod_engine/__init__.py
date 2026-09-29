@@ -7,6 +7,7 @@ upstream profile manager, its database, or its API.
 
 from .domain import (
     AccountGroup,
+    HealthIssueType,
     HealthStatus,
     LifecycleStatus,
     Persona,
@@ -24,6 +25,7 @@ __all__ = [
     "AccountGroup",
     "AdapterRegistry",
     "HealthReport",
+    "HealthIssueType",
     "HealthStatus",
     "LifecycleStatus",
     "Persona",

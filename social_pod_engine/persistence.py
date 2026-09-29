@@ -11,6 +11,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     String,
@@ -24,6 +25,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from .domain import (
     AccountGroup,
+    HealthIssueType,
     HealthStatus,
     LifecycleStatus,
     Persona,
@@ -77,6 +79,13 @@ class SocialAccountSchema(SocialPodORMBase):
     session_status: Mapped[str] = mapped_column(String(32), nullable=False)
     lifecycle_status: Mapped[str] = mapped_column(String(32), nullable=False)
     quota_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    quarantined: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quarantine_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    quarantine_issue_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quarantined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    healthy_check_streak: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_healthcheck_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_healthcheck_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
@@ -102,6 +111,7 @@ class SocialPodDatabase:
     def initialize(self) -> None:
         SocialPodORMBase.metadata.create_all(self.engine)
         self._migrate_social_account_metadata()
+        self._migrate_social_account_health()
 
     def close(self) -> None:
         self.engine.dispose()
@@ -190,6 +200,29 @@ class SocialPodDatabase:
             ).all()
             return [_account_from_schema(row) for row in rows]
 
+    def list_healthcheck_candidates(self, group_id: UUID | str | None = None) -> list[SocialAccount]:
+        with self._session() as session:
+            statement = select(SocialAccountSchema).order_by(SocialAccountSchema.created_at, SocialAccountSchema.id)
+            if group_id is not None:
+                statement = statement.where(SocialAccountSchema.group_id == str(group_id))
+            rows = session.scalars(statement).all()
+            return [_account_from_schema(row) for row in rows]
+
+    def list_due_healthchecks(self, now: datetime, *, limit: int) -> list[SocialAccount]:
+        if limit < 1:
+            return []
+        with self._session() as session:
+            rows = session.scalars(
+                select(SocialAccountSchema)
+                .where(
+                    (SocialAccountSchema.next_healthcheck_at.is_(None))
+                    | (SocialAccountSchema.next_healthcheck_at <= now)
+                )
+                .order_by(SocialAccountSchema.next_healthcheck_at, SocialAccountSchema.created_at)
+                .limit(limit)
+            ).all()
+            return [_account_from_schema(row) for row in rows]
+
     def _migrate_social_account_metadata(self) -> None:
         """Add Phase 2 account metadata without affecting any upstream schema."""
         columns = {column["name"] for column in inspect(self.engine).get_columns("social_accounts")}
@@ -198,6 +231,23 @@ class SocialPodDatabase:
                 connection.execute(
                     text("ALTER TABLE social_accounts ADD COLUMN metadata JSON NOT NULL DEFAULT '{}'"),
                 )
+
+    def _migrate_social_account_health(self) -> None:
+        """Add Phase 4 health fields inside the Social Pod database only."""
+        columns = {column["name"] for column in inspect(self.engine).get_columns("social_accounts")}
+        migrations = {
+            "quarantined": "ALTER TABLE social_accounts ADD COLUMN quarantined BOOLEAN NOT NULL DEFAULT 0",
+            "quarantine_reason": "ALTER TABLE social_accounts ADD COLUMN quarantine_reason VARCHAR(512)",
+            "quarantine_issue_type": "ALTER TABLE social_accounts ADD COLUMN quarantine_issue_type VARCHAR(64)",
+            "quarantined_at": "ALTER TABLE social_accounts ADD COLUMN quarantined_at DATETIME",
+            "healthy_check_streak": "ALTER TABLE social_accounts ADD COLUMN healthy_check_streak INTEGER NOT NULL DEFAULT 0",
+            "last_healthcheck_at": "ALTER TABLE social_accounts ADD COLUMN last_healthcheck_at DATETIME",
+            "next_healthcheck_at": "ALTER TABLE social_accounts ADD COLUMN next_healthcheck_at DATETIME",
+        }
+        with self.engine.begin() as connection:
+            for name, statement in migrations.items():
+                if name not in columns:
+                    connection.execute(text(statement))
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection: Any, _: Any) -> None:
@@ -239,6 +289,15 @@ def _apply_account_to_schema(account: SocialAccount, row: SocialAccountSchema) -
     row.session_status = account.session_status.value
     row.lifecycle_status = account.lifecycle_status.value
     row.quota_status = account.quota_status.value
+    row.quarantined = account.quarantined
+    row.quarantine_reason = account.quarantine_reason
+    row.quarantine_issue_type = (
+        account.quarantine_issue_type.value if account.quarantine_issue_type is not None else None
+    )
+    row.quarantined_at = account.quarantined_at
+    row.healthy_check_streak = account.healthy_check_streak
+    row.last_healthcheck_at = account.last_healthcheck_at
+    row.next_healthcheck_at = account.next_healthcheck_at
     row.created_at = account.created_at
     row.updated_at = account.updated_at
 
@@ -262,6 +321,15 @@ def _account_from_schema(row: SocialAccountSchema) -> SocialAccount:
         session_status=SessionStatus(row.session_status),
         lifecycle_status=LifecycleStatus(row.lifecycle_status),
         quota_status=QuotaStatus(row.quota_status),
+        quarantined=row.quarantined,
+        quarantine_reason=row.quarantine_reason,
+        quarantine_issue_type=(
+            HealthIssueType(row.quarantine_issue_type) if row.quarantine_issue_type is not None else None
+        ),
+        quarantined_at=_restore_datetime(row.quarantined_at) if row.quarantined_at else None,
+        healthy_check_streak=row.healthy_check_streak,
+        last_healthcheck_at=_restore_datetime(row.last_healthcheck_at) if row.last_healthcheck_at else None,
+        next_healthcheck_at=_restore_datetime(row.next_healthcheck_at) if row.next_healthcheck_at else None,
         created_at=_restore_datetime(row.created_at),
         updated_at=_restore_datetime(row.updated_at),
     )

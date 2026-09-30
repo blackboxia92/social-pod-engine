@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from ..domain import SocialPlatform
 from ..persistence import SocialPodDatabase
+from ..runtime import build_runtime
 
 
 @dataclass
@@ -80,9 +81,18 @@ class XOperator:
 
 
 def main() -> None:
-    database = SocialPodDatabase()
-    database.initialize()
-    XOperator(database).run()
+    runtime = build_runtime()
+    try:
+        status = asyncio.run(runtime.camoufox_status())
+    except Exception:
+        print("\nCamoufox Profile Manager no está disponible.\n\nVerificá que el servicio esté iniciado.")
+        return
+    if not status.available:
+        print("\nCamoufox Profile Manager no está disponible.\n\nVerificá que el servicio esté iniciado.")
+        return
+    mode = "REAL" if runtime.config.execution_enabled else "SAFE"
+    print(f"Camoufox: ONLINE | Social Pod DB: OK | Execution: {mode}")
+    XOperator(runtime.database).run()
 
 
 if __name__ == "__main__":

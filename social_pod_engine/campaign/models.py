@@ -24,6 +24,7 @@ class TaskStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    UNKNOWN_EXTERNAL_STATE = "unknown_external_state"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
 
@@ -46,6 +47,7 @@ class BlockReason(str, Enum):
     QUOTA_EXHAUSTED = "quota_exhausted"
     LIFECYCLE_INELIGIBLE = "lifecycle_ineligible"
     ACCOUNT_NOT_FOUND = "account_not_found"
+    CONTENT_NOT_APPROVED = "content_not_approved"
     UNKNOWN = "unknown"
 
 
@@ -121,6 +123,9 @@ class ExecutionTask:
     block_reason: BlockReason | None = None
     claimed_by: str | None = None
     claimed_until: datetime | None = None
+    external_id: str | None = None
+    external_url: str | None = None
+    external_confirmed_at: datetime | None = None
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:

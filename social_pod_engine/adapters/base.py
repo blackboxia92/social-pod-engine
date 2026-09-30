@@ -52,6 +52,16 @@ class ExecutionResult:
     reasons: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ExternalExecutionResult:
+    success: bool
+    confirmed: bool
+    external_id: str | None = None
+    external_url: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    reasons: tuple[str, ...] = ()
+
+
 class CapabilityNotSupported(NotImplementedError):
     def __init__(self, platform_name: str, capability: Capability) -> None:
         self.platform_name = platform_name
@@ -89,5 +99,5 @@ class BaseSocialAdapter(ABC):
         capability: Capability,
         payload: Mapping[str, Any],
         context: ExecutionContext,
-    ) -> ExecutionResult:
+    ) -> ExecutionResult | ExternalExecutionResult:
         """Execute an explicitly supported capability or raise an explicit error."""

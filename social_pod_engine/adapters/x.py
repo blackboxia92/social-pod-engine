@@ -14,6 +14,7 @@ from .base import (
     ChallengeType,
     ExecutionContext,
     ExecutionResult,
+    ExternalExecutionResult,
     HealthSignal,
 )
 
@@ -32,6 +33,8 @@ class XAdapter(BaseSocialAdapter):
         "[data-testid='SideNav_AccountSwitcher_Button']",
         "a[data-testid='AppTabBar_Profile_Link']",
     )
+    _composer_selector = "[data-testid='tweetTextarea_0']"
+    _post_button_selector = "[data-testid='tweetButtonInline']"
 
     @property
     def platform_name(self) -> str:
@@ -95,14 +98,14 @@ class XAdapter(BaseSocialAdapter):
         return ChallengeType.AUTHENTICATION if report.state is SessionState.CHALLENGE else ChallengeType.NONE
 
     def get_supported_capabilities(self) -> frozenset[Capability]:
-        return frozenset({Capability.SESSION_HEALTH, Capability.READ_PROFILE})
+        return frozenset({Capability.SESSION_HEALTH, Capability.READ_PROFILE, Capability.POST})
 
     async def execute_capability(
         self,
         capability: Capability,
         payload: Mapping[str, Any],
         context: ExecutionContext,
-    ) -> ExecutionResult:
+    ) -> ExecutionResult | ExternalExecutionResult:
         if not isinstance(capability, Capability):
             capability = Capability(capability)
         if capability is Capability.SESSION_HEALTH:
@@ -130,7 +133,26 @@ class XAdapter(BaseSocialAdapter):
                     "profile_id": profile.profile_id,
                 },
             )
+        if capability is Capability.POST:
+            return await self._post(payload, self._page_from(context))
         raise CapabilityNotSupported(self.platform_name, capability)
+
+    async def _post(self, payload: Mapping[str, Any], page: SocialPage) -> ExternalExecutionResult:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("X POST requires non-empty final text")
+        composer: Any = page.locator(self._composer_selector)
+        if not await composer.count():
+            raise ValueError("X post composer is unavailable")
+        await composer.fill(text)
+        button: Any = page.locator(self._post_button_selector)
+        if not await button.count():
+            raise ValueError("X post button is unavailable")
+        await button.click()
+        url = getattr(page, "url", "")
+        path = urlparse(url).path.strip("/").split("/")
+        external_id = path[-1] if len(path) >= 3 and path[-2] == "status" else None
+        return ExternalExecutionResult(True, bool(external_id), external_id=external_id, external_url=url or None)
 
     @staticmethod
     def _page_from(context: ExecutionContext) -> SocialPage:

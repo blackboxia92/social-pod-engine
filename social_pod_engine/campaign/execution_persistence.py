@@ -52,6 +52,9 @@ _tasks = Table(
     Column("block_reason", String(64), nullable=True),
     Column("claimed_by", String(255), nullable=True),
     Column("claimed_until", DateTime(timezone=True), nullable=True, index=True),
+    Column("external_id", String(255), nullable=True),
+    Column("external_url", String(1024), nullable=True),
+    Column("external_confirmed_at", DateTime(timezone=True), nullable=True),
 )
 _events = Table(
     "execution_task_events",
@@ -77,6 +80,7 @@ class ExecutionTaskStore:
         TaskStatus.READY: {TaskStatus.RUNNING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
         TaskStatus.RUNNING: {TaskStatus.READY, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED},
         TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.CANCELLED},
+        TaskStatus.UNKNOWN_EXTERNAL_STATE: {TaskStatus.READY, TaskStatus.COMPLETED},
         TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.CANCELLED},
         TaskStatus.COMPLETED: set(),
         TaskStatus.CANCELLED: set(),
@@ -94,6 +98,9 @@ class ExecutionTaskStore:
                 "ALTER TABLE execution_tasks ADD COLUMN schedule_is_immediate INTEGER NOT NULL DEFAULT 0"
             ),
             "block_reason": "ALTER TABLE execution_tasks ADD COLUMN block_reason VARCHAR(64)",
+            "external_id": "ALTER TABLE execution_tasks ADD COLUMN external_id VARCHAR(255)",
+            "external_url": "ALTER TABLE execution_tasks ADD COLUMN external_url VARCHAR(1024)",
+            "external_confirmed_at": "ALTER TABLE execution_tasks ADD COLUMN external_confirmed_at DATETIME",
         }
         with self.database.engine.begin() as connection:
             for name, statement in migrations.items():
@@ -217,6 +224,18 @@ class ExecutionTaskStore:
             clear_claim=True,
             completed_at=utc_now(),
         )
+
+    def complete_external(self, task_id: UUID, *, external_id: str | None, external_url: str | None) -> ExecutionTask:
+        task = self._required(task_id)
+        completed = self._transition(task, TaskStatus.COMPLETED, event="EXECUTION_COMPLETED", clear_claim=True, completed_at=utc_now())
+        return self._update(completed.id, event="EXTERNAL_ACTION_CONFIRMED", external_id=external_id, external_url=external_url, external_confirmed_at=utc_now())
+
+    def mark_unknown_external(self, task_id: UUID, reason: str) -> ExecutionTask:
+        return self._transition(self._required(task_id), TaskStatus.UNKNOWN_EXTERNAL_STATE, reason=reason, event="EXTERNAL_STATE_UNKNOWN", clear_claim=True)
+
+    def add_event(self, task_id: UUID, event: str, details: dict[str, object] | None = None) -> None:
+        with self.database.engine.begin() as connection:
+            self._event(connection, task_id, event, details=details)
 
     def update_payload(self, task_id: UUID, payload: dict[str, object]) -> ExecutionTask:
         """Attach approved editorial content without changing queue status or executing it."""
@@ -397,6 +416,9 @@ def _task_values(task: ExecutionTask) -> dict[str, object]:
         "block_reason": task.block_reason.value if task.block_reason is not None else None,
         "claimed_by": task.claimed_by,
         "claimed_until": task.claimed_until,
+        "external_id": task.external_id,
+        "external_url": task.external_url,
+        "external_confirmed_at": task.external_confirmed_at,
     }
 
 
@@ -425,4 +447,7 @@ def _task_from_row(row: Any) -> ExecutionTask:
         block_reason=BlockReason(row.block_reason) if row.block_reason else None,
         claimed_by=row.claimed_by,
         claimed_until=_restore_datetime(row.claimed_until) if row.claimed_until else None,
+        external_id=row.external_id,
+        external_url=row.external_url,
+        external_confirmed_at=_restore_datetime(row.external_confirmed_at) if row.external_confirmed_at else None,
     )

@@ -117,6 +117,7 @@ class MutableXAdapter(XAdapter):
 
     def get_supported_capabilities(self):
         capabilities = set(super().get_supported_capabilities())
+        capabilities.discard(Capability.POST)
         if self.post_enabled:
             capabilities.add(Capability.POST)
         return frozenset(capabilities)
@@ -150,13 +151,12 @@ def test_pending_approval_cannot_be_ready_and_x_write_capability_is_blocked(data
     with pytest.raises(InvalidTaskTransition):
         queue.mark_ready(task.id)
 
-    blocked = bridge.approve(task.id)
-    assert blocked.status is TaskStatus.BLOCKED
-    assert blocked.block_reason is BlockReason.CAPABILITY_NOT_SUPPORTED
+    ready = bridge.approve(task.id)
+    assert ready.status is TaskStatus.READY
     assert [item["event_type"] for item in queue.list_events(task.id)] == [
         "CREATED",
         "APPROVED",
-        "BLOCKED",
+        "READY",
     ]
 
 
@@ -241,7 +241,7 @@ def test_dispatcher_dry_run_returns_would_execute_without_marking_completed(data
     assert result.task.completed_at is None
     assert result.task.attempt_count == 0
     assert "WOULD_EXECUTE" in [item["event_type"] for item in queue.list_events(task.id)]
-    with pytest.raises(ValueError, match="dry-run"):
+    with pytest.raises(ValueError, match="gateway"):
         ExecutionDispatcher(database, queue, _registry(), execution_enabled=True)
 
 
@@ -259,17 +259,14 @@ def test_failure_retries_only_until_max_attempts_and_report_summarizes_blocks(da
     ready_again = queue.fail(task.id, "TEMPORARY_FAILURE")
     assert ready_again.status is TaskStatus.READY
 
-    blocked_task = bridge.create_task(
+    bridge.create_task(
         campaign_id=campaign.id,
         assignment_id=assignment.id,
         approval_required=False,
     )
     report = queue.report()
-    assert report.count(TaskStatus.READY) == 1
-    assert report.count(TaskStatus.BLOCKED) == 1
-    assert report.blocked_by_account_reason[
-        (str(blocked_task.account_id), BlockReason.CAPABILITY_NOT_SUPPORTED)
-    ] == 1
+    assert report.count(TaskStatus.READY) == 2
+    assert report.count(TaskStatus.BLOCKED) == 0
 
 
 def test_blocked_capability_task_can_be_reevaluated_after_adapter_rollout(database):

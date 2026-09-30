@@ -58,6 +58,7 @@ async def test_x_exposes_only_read_only_capabilities_and_reports_session_health(
     assert adapter.get_supported_capabilities() == {
         Capability.SESSION_HEALTH,
         Capability.READ_PROFILE,
+        Capability.POST,
     }
     assert await adapter.validate_session(context) is SessionStatus.VALID
     signal = await adapter.check_health(context)
@@ -66,7 +67,7 @@ async def test_x_exposes_only_read_only_capabilities_and_reports_session_health(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("capability", [Capability.POST, Capability.REPLY, Capability.LIKE, Capability.FOLLOW, Capability.REPOST])
+@pytest.mark.parametrize("capability", [Capability.REPLY, Capability.LIKE, Capability.FOLLOW, Capability.REPOST])
 async def test_x_rejects_every_write_capability(capability):
     adapter = XAdapter()
     with pytest.raises(CapabilityNotSupported):

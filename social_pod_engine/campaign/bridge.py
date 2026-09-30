@@ -7,46 +7,12 @@ from hashlib import sha256
 from uuid import UUID
 
 from ..adapters.base import Capability
-from ..domain import (
-    HealthStatus,
-    LifecycleStatus,
-    QuotaStatus,
-    SessionStatus,
-    SocialAccount,
-    utc_now,
-)
 from ..narrative.persistence import NarrativeCampaignStore
 from ..persistence import SocialPodDatabase
 from ..registry import AdapterRegistry
+from .eligibility import ExecutionEligibilityEvaluator, ExecutionEligibilityPolicy
 from .execution_persistence import ExecutionTaskStore
-from .models import ApprovalStatus, ExecutionTask, TaskStatus
-
-
-class TaskPreconditionValidator:
-    """The execution plane consumes, but does not mutate, Control Plane eligibility."""
-
-    def __init__(self, database: SocialPodDatabase, adapters: AdapterRegistry) -> None:
-        self.database = database
-        self.adapters = adapters
-
-    def reason(self, account: SocialAccount, capability: Capability) -> str | None:
-        if account.quarantined:
-            return "ACCOUNT_QUARANTINED"
-        if account.lifecycle_status not in {LifecycleStatus.WARMUP, LifecycleStatus.ACTIVE}:
-            return "ACCOUNT_LIFECYCLE_INELIGIBLE"
-        if account.health_status is not HealthStatus.HEALTHY:
-            return "ACCOUNT_HEALTH_NOT_HEALTHY"
-        if account.session_status is not SessionStatus.VALID:
-            return "ACCOUNT_SESSION_NOT_VALID"
-        if account.quota_status is QuotaStatus.EXHAUSTED:
-            return "ACCOUNT_QUOTA_EXHAUSTED"
-        try:
-            adapter = self.adapters.get(account.platform.value)
-        except KeyError:
-            return "CAPABILITY_NOT_SUPPORTED"
-        if capability not in adapter.get_supported_capabilities():
-            return "CAPABILITY_NOT_SUPPORTED"
-        return None
+from .models import ApprovalStatus, BlockReason, ExecutionTask, TaskStatus
 
 
 class ExecutionBridge:
@@ -58,11 +24,12 @@ class ExecutionBridge:
         campaigns: NarrativeCampaignStore,
         queue: ExecutionTaskStore,
         adapters: AdapterRegistry,
+        eligibility_policy: ExecutionEligibilityPolicy | None = None,
     ) -> None:
         self.database = database
         self.campaigns = campaigns
         self.queue = queue
-        self.validator = TaskPreconditionValidator(database, adapters)
+        self.eligibility = ExecutionEligibilityEvaluator(adapters, eligibility_policy)
 
     def create_task(
         self,
@@ -70,7 +37,9 @@ class ExecutionBridge:
         campaign_id: UUID,
         assignment_id: UUID,
         capability: Capability = Capability.POST,
-        approval_required: bool = True,
+        revision: int = 1,
+        approval_required: bool | None = None,
+        inherited_approval_status: ApprovalStatus | None = None,
         scheduled_for: datetime | None = None,
     ) -> ExecutionTask:
         assignment = self.campaigns.get_assignment(assignment_id)
@@ -79,7 +48,8 @@ class ExecutionBridge:
         account = self.database.get_social_account(assignment.account_id)
         if account is None:
             raise KeyError(f"SocialAccount not found: {assignment.account_id}")
-        key = self.idempotency_key(assignment.id, capability)
+        approval_status = self._approval_status(approval_required, inherited_approval_status)
+        key = self.idempotency_key(assignment.id, capability, revision)
         task = ExecutionTask(
             campaign_id=campaign_id,
             assignment_id=assignment.id,
@@ -93,11 +63,12 @@ class ExecutionBridge:
                 "content_state": "pending_generation",
             },
             idempotency_key=key,
-            scheduled_for=scheduled_for or utc_now(),
-            approval_status=(ApprovalStatus.PENDING if approval_required else ApprovalStatus.NOT_REQUIRED),
+            scheduled_for=scheduled_for,
+            revision=revision,
+            approval_status=approval_status,
         )
         stored = self.queue.enqueue(task)
-        if stored.id != task.id or approval_required:
+        if stored.id != task.id or approval_status is ApprovalStatus.PENDING:
             return stored
         return self.prepare(stored.id)
 
@@ -111,17 +82,44 @@ class ExecutionBridge:
             raise KeyError(f"Execution task not found: {task_id}")
         if task.approval_status is ApprovalStatus.PENDING:
             return task
+        if task.approval_status is ApprovalStatus.REJECTED:
+            if task.status is TaskStatus.PLANNED:
+                return self.queue.cancel(task.id, "approval was rejected by the inherited or task-level policy")
+            return task
         account = self.database.get_social_account(task.account_id)
         if account is None:
-            return self.queue.block(task.id, "ACCOUNT_NOT_FOUND")
-        reason = self.validator.reason(account, task.capability)
-        if reason:
-            return self.queue.block(task.id, reason)
-        if task.status is TaskStatus.PLANNED:
+            return self.queue.block(task.id, BlockReason.ACCOUNT_NOT_FOUND, "account no longer exists")
+        eligibility = self.eligibility.evaluate(account, task.capability)
+        if not eligibility.eligible:
+            return self.queue.block(
+                task.id,
+                eligibility.block_reason or BlockReason.UNKNOWN,
+                eligibility.description,
+            )
+        if task.status in {TaskStatus.PLANNED, TaskStatus.BLOCKED}:
             return self.queue.mark_ready(task.id)
         return task
 
+    def reevaluate_blocked_task(self, task_id: UUID) -> ExecutionTask:
+        """Reapply the shared policy after an adapter/account condition changes."""
+        task = self.queue.get(task_id)
+        if task is None:
+            raise KeyError(f"Execution task not found: {task_id}")
+        if task.status is not TaskStatus.BLOCKED:
+            raise ValueError("only blocked tasks can be reevaluated")
+        return self.prepare(task_id)
+
     @staticmethod
-    def idempotency_key(assignment_id: UUID, capability: Capability) -> str:
-        material = f"{assignment_id}:{Capability(capability).value}".encode()
+    def idempotency_key(assignment_id: UUID, capability: Capability, revision: int = 1) -> str:
+        material = f"{assignment_id}:{Capability(capability).value}:{revision}".encode()
         return sha256(material).hexdigest()
+
+    @staticmethod
+    def _approval_status(
+        approval_required: bool | None, inherited_approval_status: ApprovalStatus | None
+    ) -> ApprovalStatus:
+        if inherited_approval_status is not None:
+            return ApprovalStatus(inherited_approval_status)
+        if approval_required is False:
+            return ApprovalStatus.NOT_REQUIRED
+        return ApprovalStatus.PENDING

@@ -35,6 +35,29 @@ class ApprovalStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class BlockReason(str, Enum):
+    """Structured precondition failures; human context belongs in ``last_error``."""
+
+    ACCOUNT_QUARANTINED = "account_quarantined"
+    SESSION_INVALID = "session_invalid"
+    ACCOUNT_UNHEALTHY = "account_unhealthy"
+    CAPABILITY_NOT_SUPPORTED = "capability_not_supported"
+    APPROVAL_REQUIRED = "approval_required"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    LIFECYCLE_INELIGIBLE = "lifecycle_ineligible"
+    ACCOUNT_NOT_FOUND = "account_not_found"
+    UNKNOWN = "unknown"
+
+
+class DispatchOutcome(str, Enum):
+    """Operational result of the current dry-run dispatcher pass."""
+
+    NO_TASK = "no_task"
+    CLAIM_LOST = "claim_lost"
+    WOULD_EXECUTE = "would_execute"
+    BLOCKED = "blocked"
+
+
 @dataclass(frozen=True, slots=True)
 class PlannedAssignment:
     account_id: UUID
@@ -85,7 +108,8 @@ class ExecutionTask:
     capability: Capability
     payload: dict[str, object]
     idempotency_key: str
-    scheduled_for: datetime
+    scheduled_for: datetime | None = None
+    revision: int = 1
     status: TaskStatus = TaskStatus.PLANNED
     approval_status: ApprovalStatus = ApprovalStatus.PENDING
     attempt_count: int = 0
@@ -94,6 +118,7 @@ class ExecutionTask:
     started_at: datetime | None = None
     completed_at: datetime | None = None
     last_error: str | None = None
+    block_reason: BlockReason | None = None
     claimed_by: str | None = None
     claimed_until: datetime | None = None
     id: UUID = field(default_factory=uuid4)
@@ -103,9 +128,10 @@ class ExecutionTask:
         self.capability = Capability(self.capability)
         self.status = TaskStatus(self.status)
         self.approval_status = ApprovalStatus(self.approval_status)
+        self.block_reason = BlockReason(self.block_reason) if self.block_reason is not None else None
         if not self.idempotency_key.strip():
             raise ValueError("ExecutionTask.idempotency_key is required")
-        if self.attempt_count < 0 or self.max_attempts < 1:
+        if self.attempt_count < 0 or self.max_attempts < 1 or self.revision < 1:
             raise ValueError("attempt counts must be non-negative and max_attempts must be positive")
         self.payload = _normalize_payload(self.payload)
         for name in ("scheduled_for", "created_at", "started_at", "completed_at", "claimed_until"):
@@ -116,6 +142,12 @@ class ExecutionTask:
                 setattr(self, name, value.astimezone(timezone.utc))
         self.last_error = self.last_error.strip() if self.last_error else None
         self.claimed_by = self.claimed_by.strip() if self.claimed_by else None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionDispatchResult:
+    outcome: DispatchOutcome
+    task: ExecutionTask | None = None
 
 
 def _normalize_payload(payload: dict[str, object]) -> dict[str, object]:

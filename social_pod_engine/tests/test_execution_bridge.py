@@ -8,11 +8,17 @@ from social_pod_engine.adapters.base import Capability
 from social_pod_engine.adapters.x import XAdapter
 from social_pod_engine.campaign.bridge import ExecutionBridge
 from social_pod_engine.campaign.dispatcher import ExecutionDispatcher
+from social_pod_engine.campaign.eligibility import ExecutionEligibilityPolicy
 from social_pod_engine.campaign.execution_persistence import (
     ExecutionTaskStore,
     InvalidTaskTransition,
 )
-from social_pod_engine.campaign.models import ApprovalStatus, TaskStatus
+from social_pod_engine.campaign.models import (
+    ApprovalStatus,
+    BlockReason,
+    DispatchOutcome,
+    TaskStatus,
+)
 from social_pod_engine.campaign.planner import CampaignPlannerService
 from social_pod_engine.domain import (
     AccountGroup,
@@ -86,15 +92,34 @@ def _seed_assignment(database: SocialPodDatabase, *, quarantined: bool = False):
     return store, campaign, account, plan.assignments[0]
 
 
-def _registry() -> AdapterRegistry:
+def _registry(adapter: XAdapter | None = None) -> AdapterRegistry:
     registry = AdapterRegistry()
-    registry.register(XAdapter())
+    registry.register(adapter or XAdapter())
     return registry
 
 
-def _bridge(database: SocialPodDatabase, store: NarrativeCampaignStore) -> tuple[ExecutionBridge, ExecutionTaskStore]:
+def _bridge(
+    database: SocialPodDatabase,
+    store: NarrativeCampaignStore,
+    *,
+    adapter: XAdapter | None = None,
+    policy: ExecutionEligibilityPolicy | None = None,
+) -> tuple[ExecutionBridge, ExecutionTaskStore]:
     queue = ExecutionTaskStore(database)
-    return ExecutionBridge(database, store, queue, _registry()), queue
+    return ExecutionBridge(database, store, queue, _registry(adapter), policy), queue
+
+
+class MutableXAdapter(XAdapter):
+    """Test-only adapter representing a later capability rollout."""
+
+    def __init__(self) -> None:
+        self.post_enabled = False
+
+    def get_supported_capabilities(self):
+        capabilities = set(super().get_supported_capabilities())
+        if self.post_enabled:
+            capabilities.add(Capability.POST)
+        return frozenset(capabilities)
 
 
 def test_bridge_persists_structured_approval_gated_execution_task(database):
@@ -127,7 +152,7 @@ def test_pending_approval_cannot_be_ready_and_x_write_capability_is_blocked(data
 
     blocked = bridge.approve(task.id)
     assert blocked.status is TaskStatus.BLOCKED
-    assert blocked.last_error == "CAPABILITY_NOT_SUPPORTED"
+    assert blocked.block_reason is BlockReason.CAPABILITY_NOT_SUPPORTED
     assert [item["event_type"] for item in queue.list_events(task.id)] == [
         "CREATED",
         "APPROVED",
@@ -147,7 +172,7 @@ def test_quarantined_account_is_blocked_without_changing_control_plane_state(dat
     )
 
     assert task.status is TaskStatus.BLOCKED
-    assert task.last_error == "ACCOUNT_QUARANTINED"
+    assert task.block_reason is BlockReason.ACCOUNT_QUARANTINED
     restored = database.get_social_account(account.id)
     assert restored is not None
     assert restored.lifecycle_status is LifecycleStatus.WARMUP
@@ -197,7 +222,7 @@ def test_claim_is_atomic_and_expired_claim_is_recovered(database):
     assert queue.get(task.id).status is TaskStatus.READY
 
 
-def test_dispatcher_dry_run_completes_without_calling_adapter_execution(database):
+def test_dispatcher_dry_run_returns_would_execute_without_marking_completed(database):
     store, campaign, _, assignment = _seed_assignment(database)
     bridge, queue = _bridge(database, store)
     task = bridge.create_task(
@@ -207,12 +232,15 @@ def test_dispatcher_dry_run_completes_without_calling_adapter_execution(database
         approval_required=False,
     )
 
-    completed = ExecutionDispatcher(database, queue, _registry()).run_once("dry-worker")
+    result = ExecutionDispatcher(database, queue, _registry()).run_once("dry-worker")
 
-    assert completed is not None
-    assert completed.id == task.id
-    assert completed.status is TaskStatus.COMPLETED
-    assert completed.attempt_count == 1
+    assert result.outcome is DispatchOutcome.WOULD_EXECUTE
+    assert result.task is not None
+    assert result.task.id == task.id
+    assert result.task.status is TaskStatus.READY
+    assert result.task.completed_at is None
+    assert result.task.attempt_count == 0
+    assert "WOULD_EXECUTE" in [item["event_type"] for item in queue.list_events(task.id)]
     with pytest.raises(ValueError, match="dry-run"):
         ExecutionDispatcher(database, queue, _registry(), execution_enabled=True)
 
@@ -239,4 +267,140 @@ def test_failure_retries_only_until_max_attempts_and_report_summarizes_blocks(da
     report = queue.report()
     assert report.count(TaskStatus.READY) == 1
     assert report.count(TaskStatus.BLOCKED) == 1
-    assert report.blocked_by_account_reason[(str(blocked_task.account_id), "CAPABILITY_NOT_SUPPORTED")] == 1
+    assert report.blocked_by_account_reason[
+        (str(blocked_task.account_id), BlockReason.CAPABILITY_NOT_SUPPORTED)
+    ] == 1
+
+
+def test_blocked_capability_task_can_be_reevaluated_after_adapter_rollout(database):
+    store, campaign, _, assignment = _seed_assignment(database)
+    adapter = MutableXAdapter()
+    bridge, _ = _bridge(database, store, adapter=adapter)
+    task = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        approval_required=False,
+    )
+    assert task.block_reason is BlockReason.CAPABILITY_NOT_SUPPORTED
+
+    adapter.post_enabled = True
+    reevaluated = bridge.reevaluate_blocked_task(task.id)
+
+    assert reevaluated.status is TaskStatus.READY
+    assert reevaluated.block_reason is None
+    assert reevaluated.last_error is None
+
+
+def test_quarantined_task_can_be_reevaluated_after_control_plane_recovery(database):
+    store, campaign, account, assignment = _seed_assignment(database, quarantined=True)
+    bridge, _ = _bridge(database, store)
+    task = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        approval_required=False,
+    )
+    assert task.status is TaskStatus.BLOCKED
+
+    account.quarantined = False
+    database.save_social_account(account)
+    reevaluated = bridge.reevaluate_blocked_task(task.id)
+
+    assert reevaluated.status is TaskStatus.READY
+    assert reevaluated.block_reason is None
+
+
+def test_degraded_health_is_controlled_by_explicit_eligibility_policy(database):
+    store, campaign, account, assignment = _seed_assignment(database)
+    account.health_status = HealthStatus.DEGRADED
+    database.save_social_account(account)
+    restrictive, _ = _bridge(database, store)
+    blocked = restrictive.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        approval_required=False,
+    )
+    permissive, _ = _bridge(
+        database,
+        store,
+        policy=ExecutionEligibilityPolicy(allow_degraded_accounts=True),
+    )
+    allowed = permissive.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        revision=2,
+        approval_required=False,
+    )
+
+    assert blocked.block_reason is BlockReason.ACCOUNT_UNHEALTHY
+    assert allowed.status is TaskStatus.READY
+
+
+def test_revision_scopes_idempotency_and_scheduled_for_can_be_immediate(database):
+    store, campaign, _, assignment = _seed_assignment(database)
+    bridge, queue = _bridge(database, store)
+    first = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        approval_required=False,
+    )
+    same_revision = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        approval_required=False,
+    )
+    revised = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        revision=2,
+        approval_required=False,
+    )
+
+    assert first.id == same_revision.id
+    assert revised.id != first.id
+    assert revised.idempotency_key != first.idempotency_key
+    assert first.scheduled_for is None
+    restored = queue.get(first.id)
+    assert restored is not None
+    assert restored.scheduled_for is None
+    assert {item.id for item in queue.dequeue_ready(limit=10)} == {first.id, revised.id}
+
+
+def test_inherited_approval_can_make_a_task_ready_without_per_task_approval(database):
+    store, campaign, _, assignment = _seed_assignment(database)
+    bridge, _ = _bridge(database, store)
+
+    task = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        inherited_approval_status=ApprovalStatus.APPROVED,
+    )
+
+    assert task.approval_status is ApprovalStatus.APPROVED
+    assert task.status is TaskStatus.READY
+
+
+def test_dispatcher_reuses_the_shared_eligibility_result_before_dry_run(database):
+    store, campaign, account, assignment = _seed_assignment(database)
+    bridge, queue = _bridge(database, store)
+    task = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        approval_required=False,
+    )
+    account.session_status = SessionStatus.EXPIRED
+    database.save_social_account(account)
+
+    result = ExecutionDispatcher(database, queue, _registry()).run_once("dry-worker")
+
+    assert result.outcome is DispatchOutcome.BLOCKED
+    assert result.task is not None
+    assert result.task.block_reason is BlockReason.SESSION_INVALID
+    assert task.status is TaskStatus.READY

@@ -7,12 +7,24 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import JSON, Column, DateTime, Integer, MetaData, String, Table, select, update
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    inspect,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 
 from ..domain import SocialPlatform, utc_now
 from ..persistence import SocialPodDatabase, _restore_datetime
-from .models import ApprovalStatus, ExecutionTask, TaskStatus
+from .models import ApprovalStatus, BlockReason, ExecutionTask, TaskStatus
 
 _metadata = MetaData()
 _tasks = Table(
@@ -28,13 +40,16 @@ _tasks = Table(
     Column("status", String(32), nullable=False, index=True),
     Column("approval_status", String(32), nullable=False),
     Column("idempotency_key", String(255), nullable=False, unique=True),
+    Column("revision", Integer, nullable=False, default=1),
     Column("attempt_count", Integer, nullable=False, default=0),
     Column("max_attempts", Integer, nullable=False, default=3),
     Column("scheduled_for", DateTime(timezone=True), nullable=False, index=True),
+    Column("schedule_is_immediate", Integer, nullable=False, default=0),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("started_at", DateTime(timezone=True), nullable=True),
     Column("completed_at", DateTime(timezone=True), nullable=True),
     Column("last_error", String(512), nullable=True),
+    Column("block_reason", String(64), nullable=True),
     Column("claimed_by", String(255), nullable=True),
     Column("claimed_until", DateTime(timezone=True), nullable=True, index=True),
 )
@@ -62,7 +77,7 @@ class ExecutionTaskStore:
         TaskStatus.READY: {TaskStatus.RUNNING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
         TaskStatus.RUNNING: {TaskStatus.READY, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED},
         TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.CANCELLED},
-        TaskStatus.BLOCKED: set(),
+        TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.CANCELLED},
         TaskStatus.COMPLETED: set(),
         TaskStatus.CANCELLED: set(),
     }
@@ -72,9 +87,21 @@ class ExecutionTaskStore:
 
     def initialize(self) -> None:
         _metadata.create_all(self.database.engine)
+        columns = {column["name"] for column in inspect(self.database.engine).get_columns("execution_tasks")}
+        migrations = {
+            "revision": "ALTER TABLE execution_tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+            "schedule_is_immediate": (
+                "ALTER TABLE execution_tasks ADD COLUMN schedule_is_immediate INTEGER NOT NULL DEFAULT 0"
+            ),
+            "block_reason": "ALTER TABLE execution_tasks ADD COLUMN block_reason VARCHAR(64)",
+        }
+        with self.database.engine.begin() as connection:
+            for name, statement in migrations.items():
+                if name not in columns:
+                    connection.execute(text(statement))
 
     def enqueue(self, task: ExecutionTask) -> ExecutionTask:
-        """Persist once per assignment/capability and return an existing task on retry."""
+        """Persist once per assignment/capability/revision and return an exact retry."""
         self.initialize()
         try:
             with self.database.engine.begin() as connection:
@@ -117,10 +144,18 @@ class ExecutionTaskStore:
             raise InvalidTaskTransition("a pending-approval task cannot become READY")
         if task.approval_status is ApprovalStatus.REJECTED:
             raise InvalidTaskTransition("a rejected task cannot become READY")
-        return self._transition(task, TaskStatus.READY, event="READY")
+        return self._transition(task, TaskStatus.READY, event="READY", clear_block=True)
 
-    def block(self, task_id: UUID, reason: str) -> ExecutionTask:
-        return self._transition(self._required(task_id), TaskStatus.BLOCKED, reason=reason, event="BLOCKED")
+    def block(
+        self, task_id: UUID, reason: BlockReason, description: str | None = None
+    ) -> ExecutionTask:
+        return self._transition(
+            self._required(task_id),
+            TaskStatus.BLOCKED,
+            reason=description,
+            block_reason=reason,
+            event="BLOCKED",
+        )
 
     def cancel(self, task_id: UUID, reason: str | None = None) -> ExecutionTask:
         return self._transition(self._required(task_id), TaskStatus.CANCELLED, reason=reason, event="CANCELLED")
@@ -132,7 +167,7 @@ class ExecutionTaskStore:
             rows = connection.execute(
                 select(_tasks)
                 .where(_tasks.c.status == TaskStatus.READY.value)
-                .where(_tasks.c.scheduled_for <= now)
+                .where((_tasks.c.schedule_is_immediate == 1) | (_tasks.c.scheduled_for <= now))
                 .order_by(_tasks.c.scheduled_for, _tasks.c.created_at)
                 .limit(limit)
             )
@@ -144,6 +179,7 @@ class ExecutionTaskStore:
         *,
         worker_id: str,
         lease_seconds: int = 60,
+        increment_attempt: bool = True,
         now: datetime | None = None,
     ) -> ExecutionTask | None:
         """Atomically claim one due READY task; a second worker receives ``None``."""
@@ -160,7 +196,9 @@ class ExecutionTaskStore:
                     claimed_by=worker_id,
                     claimed_until=claimed_until,
                     started_at=now,
-                    attempt_count=_tasks.c.attempt_count + 1,
+                    attempt_count=(
+                        _tasks.c.attempt_count + 1 if increment_attempt else _tasks.c.attempt_count
+                    ),
                 )
             )
             if result.rowcount != 1:
@@ -168,8 +206,8 @@ class ExecutionTaskStore:
             self._event(connection, task_id, "CLAIMED", details={"worker_id": worker_id})
         return self.get(task_id)
 
-    def release(self, task_id: UUID) -> ExecutionTask:
-        return self._transition(self._required(task_id), TaskStatus.READY, event="READY", clear_claim=True)
+    def release(self, task_id: UUID, *, event: str = "RELEASED") -> ExecutionTask:
+        return self._transition(self._required(task_id), TaskStatus.READY, event=event, clear_claim=True)
 
     def complete(self, task_id: UUID) -> ExecutionTask:
         return self._transition(
@@ -199,10 +237,12 @@ class ExecutionTaskStore:
     def report(self) -> ExecutionQueueReport:
         self.initialize()
         with self.database.engine.connect() as connection:
-            rows = connection.execute(select(_tasks.c.status, _tasks.c.account_id, _tasks.c.last_error)).all()
+            rows = connection.execute(
+                select(_tasks.c.status, _tasks.c.account_id, _tasks.c.block_reason)
+            ).all()
         counts = Counter(TaskStatus(row.status) for row in rows)
         blocks = Counter(
-            (str(row.account_id), row.last_error or "UNSPECIFIED")
+            (str(row.account_id), BlockReason(row.block_reason or BlockReason.UNKNOWN.value))
             for row in rows
             if row.status == TaskStatus.BLOCKED.value
         )
@@ -236,13 +276,19 @@ class ExecutionTaskStore:
         target: TaskStatus,
         *,
         reason: str | None = None,
+        block_reason: BlockReason | None = None,
         event: str,
         clear_claim: bool = False,
+        clear_block: bool = False,
         completed_at: datetime | None = None,
     ) -> ExecutionTask:
         if target not in self._transitions[task.status]:
             raise InvalidTaskTransition(f"cannot transition {task.status.value} to {target.value}")
         values: dict[str, Any] = {"status": target.value, "last_error": reason}
+        if block_reason is not None:
+            values["block_reason"] = block_reason.value
+        elif clear_block:
+            values["block_reason"] = None
         if clear_claim:
             values.update(claimed_by=None, claimed_until=None)
         if completed_at is not None:
@@ -256,7 +302,10 @@ class ExecutionTaskStore:
             )
             if result.rowcount != 1:
                 raise InvalidTaskTransition("task changed before its transition could be persisted")
-            self._event(connection, task.id, event, reason=reason)
+            details: dict[str, object] | None = (
+                {"block_reason": block_reason.value} if block_reason is not None else None
+            )
+            self._event(connection, task.id, event, reason=reason, details=details)
         return self._required(task.id)
 
     def _update(self, task_id: UUID, *, event: str, **values: Any) -> ExecutionTask:
@@ -297,7 +346,7 @@ class ExecutionQueueReport:
         self,
         *,
         counts: dict[TaskStatus, int],
-        blocked_by_account_reason: dict[tuple[str, str], int],
+        blocked_by_account_reason: dict[tuple[str, BlockReason], int],
     ) -> None:
         self.counts = counts
         self.blocked_by_account_reason = blocked_by_account_reason
@@ -318,13 +367,16 @@ def _task_values(task: ExecutionTask) -> dict[str, object]:
         "status": task.status.value,
         "approval_status": task.approval_status.value,
         "idempotency_key": task.idempotency_key,
+        "revision": task.revision,
         "attempt_count": task.attempt_count,
         "max_attempts": task.max_attempts,
-        "scheduled_for": task.scheduled_for,
+        "scheduled_for": task.scheduled_for or task.created_at,
+        "schedule_is_immediate": 1 if task.scheduled_for is None else 0,
         "created_at": task.created_at,
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "last_error": task.last_error,
+        "block_reason": task.block_reason.value if task.block_reason is not None else None,
         "claimed_by": task.claimed_by,
         "claimed_until": task.claimed_until,
     }
@@ -344,13 +396,15 @@ def _task_from_row(row: Any) -> ExecutionTask:
         status=TaskStatus(row.status),
         approval_status=ApprovalStatus(row.approval_status),
         idempotency_key=row.idempotency_key,
+        revision=row.revision,
         attempt_count=row.attempt_count,
         max_attempts=row.max_attempts,
-        scheduled_for=_restore_datetime(row.scheduled_for),
+        scheduled_for=None if row.schedule_is_immediate else _restore_datetime(row.scheduled_for),
         created_at=_restore_datetime(row.created_at),
         started_at=_restore_datetime(row.started_at) if row.started_at else None,
         completed_at=_restore_datetime(row.completed_at) if row.completed_at else None,
         last_error=row.last_error,
+        block_reason=BlockReason(row.block_reason) if row.block_reason else None,
         claimed_by=row.claimed_by,
         claimed_until=_restore_datetime(row.claimed_until) if row.claimed_until else None,
     )

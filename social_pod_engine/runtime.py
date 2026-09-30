@@ -53,6 +53,7 @@ class SocialPodRuntime:
     review: ContentReviewService
     bridge: ExecutionBridge
     linker: ApprovedContentTaskLinker
+    queue: ExecutionTaskStore
 
     async def camoufox_status(self):
         return await self.gateway.service_status()
@@ -79,5 +80,5 @@ def build_runtime(config: RuntimeConfig | None = None) -> SocialPodRuntime:
         OnboardingRunner(database, adapters, gateway, config=OnboardingConfig()),
         HealthEngine(database, adapters, gateway, config=HealthEngineConfig(max_concurrency=config.max_concurrency)),
         ExecutionDispatcher(database, queue, adapters, execution_enabled=config.execution_enabled, gateway=gateway, content_store=drafts),
-        campaigns, drafts, review, bridge, ApprovedContentTaskLinker(drafts, bridge, queue),
+        campaigns, drafts, review, bridge, ApprovedContentTaskLinker(drafts, bridge, queue), queue,
     )

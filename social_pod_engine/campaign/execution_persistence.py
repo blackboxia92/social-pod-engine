@@ -285,6 +285,12 @@ class ExecutionTaskStore:
         )
         return ExecutionQueueReport(counts=dict(counts), blocked_by_account_reason=dict(blocks))
 
+    def list_tasks(self) -> list[ExecutionTask]:
+        self.initialize()
+        with self.database.engine.connect() as connection:
+            rows = connection.execute(select(_tasks).order_by(_tasks.c.created_at, _tasks.c.id))
+        return [_task_from_row(row) for row in rows]
+
     def list_events(self, task_id: UUID) -> list[dict[str, object]]:
         self.initialize()
         with self.database.engine.connect() as connection:

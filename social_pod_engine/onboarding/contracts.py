@@ -21,11 +21,22 @@ class InteractiveBrowser:
     handle: Any
 
 
+class UpstreamProfileNotFound(RuntimeError):
+    """The opaque profile reference no longer exists in the upstream service."""
+
+
 class UpstreamOnboardingGateway(Protocol):
     """Minimal asynchronous lifecycle boundary implemented outside this package."""
 
     async def create_profile(self, account: SocialAccount) -> str:
         """Create an upstream physical profile and return its opaque identifier."""
+
+    async def get_profile(self, upstream_profile_id: str) -> Any:
+        """Validate an existing opaque profile reference before it is launched.
+
+        Implementations raise :class:`UpstreamProfileNotFound` only when the
+        upstream service confirms that the profile does not exist.
+        """
 
     async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> Any:
         """Acquire the upstream lease before launching an interactive browser."""

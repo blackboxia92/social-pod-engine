@@ -1,6 +1,6 @@
 """Sequential, operator-guided onboarding for isolated Social Pod accounts."""
 
-from .contracts import InteractiveBrowser, UpstreamOnboardingGateway
+from .contracts import InteractiveBrowser, UpstreamOnboardingGateway, UpstreamProfileNotFound
 from .models import (
     OnboardingBatchReport,
     OnboardingItemResult,
@@ -22,4 +22,5 @@ __all__ = [
     "OnboardingRunner",
     "OnboardingSessionStep",
     "UpstreamOnboardingGateway",
+    "UpstreamProfileNotFound",
 ]

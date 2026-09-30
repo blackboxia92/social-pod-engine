@@ -24,6 +24,10 @@ class CamoufoxHttpUnavailable(CamoufoxHttpError):
     """The local Camoufox Profile Manager service could not be reached."""
 
 
+class CamoufoxHttpNotFound(CamoufoxHttpError):
+    """A public Camoufox API resource was confirmed not to exist."""
+
+
 class CamoufoxPageAccessUnavailable(CamoufoxHttpError):
     """The public API has launched a browser but exposes no usable page."""
 
@@ -278,6 +282,10 @@ class CamoufoxHttpClient:
 
             if response.is_error:
                 detail = _error_detail(response)
+                if response.status_code == 404:
+                    raise CamoufoxHttpNotFound(
+                        f"Camoufox Profile Manager returned HTTP 404: {detail}"
+                    )
                 raise CamoufoxHttpError(
                     f"Camoufox Profile Manager returned HTTP {response.status_code}: {detail}"
                 )
@@ -308,7 +316,14 @@ class CamoufoxHttpGateway:
         return await self._client.list_profiles()
 
     async def get_profile(self, profile_id: str) -> CamoufoxProfile:
-        return await self._client.get_profile(profile_id)
+        from ..onboarding.contracts import UpstreamProfileNotFound
+
+        try:
+            return await self._client.get_profile(profile_id)
+        except CamoufoxHttpNotFound as exc:
+            raise UpstreamProfileNotFound(
+                f"Camoufox profile {profile_id!r} does not exist in the current service instance"
+            ) from exc
 
     async def launch_profile(self, profile_id: str, *, headless: bool = False) -> CamoufoxLaunch:
         return await self._client.launch_profile(profile_id, headless=headless)

@@ -9,6 +9,7 @@ from .camoufox_http import (
     CamoufoxHttpClient,
     CamoufoxHttpError,
     CamoufoxHttpGateway,
+    CamoufoxHttpNotFound,
     CamoufoxHttpUnavailable,
     CamoufoxPageAccessUnavailable,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "CamoufoxHttpClient",
     "CamoufoxHttpError",
     "CamoufoxHttpGateway",
+    "CamoufoxHttpNotFound",
     "CamoufoxHttpUnavailable",
     "CamoufoxPageAccessUnavailable",
 ]

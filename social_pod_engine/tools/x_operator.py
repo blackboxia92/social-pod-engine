@@ -107,6 +107,10 @@ class XOperator:
         self.say(
             f"Onboarding terminado: {report.successful_logins} válido. Sesión: {current.session_status.value if current else 'unknown'}; salud: {current.health_status.value if current else 'unknown'}; cuarentena: {'SI' if current and current.quarantined else 'NO'}"
         )
+        if report.successful_logins == 0:
+            for item in report.details:
+                if item.reason:
+                    self.say(f"Motivo: {item.reason}")
 
     def healthcheck(self) -> None:
         account = self.select()

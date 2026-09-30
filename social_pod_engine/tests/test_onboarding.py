@@ -27,6 +27,7 @@ from social_pod_engine.onboarding import (
     OnboardingItemStatus,
     OnboardingQueueStatus,
     OnboardingRunner,
+    UpstreamProfileNotFound,
 )
 from social_pod_engine.persistence import SocialPodDatabase
 from social_pod_engine.registry import AdapterRegistry
@@ -76,21 +77,32 @@ class StubAdapter(BaseSocialAdapter):
 
 
 class StubUpstreamGateway:
-    def __init__(self) -> None:
+    def __init__(self, *, missing_profiles: set[str] | None = None, fail_open: bool = False) -> None:
         self.created: list[str] = []
+        self.validated_profiles: list[str] = []
         self.leases: list[tuple[str, str | None]] = []
         self.closed: list[str] = []
         self.released: list[str] = []
+        self.missing_profiles = missing_profiles or set()
+        self.fail_open = fail_open
 
     async def create_profile(self, account: SocialAccount) -> str:
         self.created.append(str(account.id))
         return f"upstream-{account.id}"
+
+    async def get_profile(self, upstream_profile_id: str) -> object:
+        self.validated_profiles.append(upstream_profile_id)
+        if upstream_profile_id in self.missing_profiles:
+            raise UpstreamProfileNotFound(f"profile {upstream_profile_id!r} was not found")
+        return object()
 
     async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> str:
         self.leases.append((upstream_profile_id, proxy_id))
         return upstream_profile_id
 
     async def open_interactive_browser(self, lease: str) -> InteractiveBrowser:
+        if self.fail_open:
+            raise RuntimeError("Camoufox could not open the remote browser")
         return InteractiveBrowser(page={"account_id": lease.removeprefix("upstream-")}, handle=lease)
 
     async def close_interactive_browser(self, browser: InteractiveBrowser) -> None:
@@ -225,8 +237,8 @@ async def test_timeout_or_failure_does_not_stop_later_accounts(database):
     assert [item.status for item in report.details] == [OnboardingItemStatus.FAILED, OnboardingItemStatus.SUCCESS]
     assert report.failed == 1
     assert report.successful_logins == 1
-    assert timed_out is not None and timed_out.session_status is SessionStatus.CHALLENGE_REQUIRED
-    assert timed_out.health_status is HealthStatus.ACTION_REQUIRED
+    assert timed_out is not None and timed_out.session_status is SessionStatus.UNKNOWN
+    assert timed_out.health_status is HealthStatus.UNAVAILABLE
     assert validated is not None and validated.session_status is SessionStatus.VALID
 
 
@@ -277,11 +289,98 @@ async def test_interactive_cancel_keeps_account_non_healthy_and_cleans_up(databa
     report = await runner.start(operator_confirmation=lambda _: "CANCELAR")
     stored = database.get_social_account(account.id)
 
-    assert report.failed == 1
+    assert report.challenges_detected == 1
     assert stored is not None and stored.session_status is SessionStatus.CHALLENGE_REQUIRED
     assert stored.health_status is HealthStatus.ACTION_REQUIRED
     assert gateway.closed == [f"upstream-{account.id}"]
     assert gateway.released == [f"upstream-{account.id}"]
+
+
+@pytest.mark.asyncio
+async def test_existing_upstream_profile_is_validated_and_reused(database):
+    account = add_account(database, "existing-profile", upstream_profile_id="current-cpm-profile")
+    runner, _, gateway = make_runner(database)
+    runner.load_queue()
+
+    result = await runner.next()
+    stored = database.get_social_account(account.id)
+
+    assert result is not None and result.status is OnboardingItemStatus.SUCCESS
+    assert stored is not None and stored.upstream_profile_id == "current-cpm-profile"
+    assert gateway.validated_profiles == ["current-cpm-profile"]
+    assert gateway.created == []
+    assert gateway.leases == [("current-cpm-profile", None)]
+
+
+@pytest.mark.asyncio
+async def test_missing_upstream_profile_is_reprovisioned_before_interactive_onboarding(database):
+    account = add_account(database, "stale-profile", upstream_profile_id="missing-cpm-profile")
+    gateway = StubUpstreamGateway(missing_profiles={"missing-cpm-profile"})
+    runner, _, gateway = make_runner(database, gateway=gateway)
+    runner.load_queue()
+
+    result = await runner.next()
+    stored = database.get_social_account(account.id)
+
+    assert result is not None and result.status is OnboardingItemStatus.SUCCESS
+    assert stored is not None and stored.upstream_profile_id == f"upstream-{account.id}"
+    assert gateway.validated_profiles == ["missing-cpm-profile"]
+    assert gateway.created == [str(account.id)]
+    assert gateway.leases == [(f"upstream-{account.id}", None)]
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_failure_preserves_reason_without_inventing_a_challenge(database):
+    account = add_account(database, "browser-failure")
+    gateway = StubUpstreamGateway(fail_open=True)
+    runner, _, gateway = make_runner(database, gateway=gateway)
+    runner.load_queue()
+
+    result = await runner.next()
+    stored = database.get_social_account(account.id)
+
+    assert result is not None and result.status is OnboardingItemStatus.FAILED
+    assert result.reason == "Camoufox could not open the remote browser"
+    assert stored is not None
+    assert stored.session_status is SessionStatus.UNKNOWN
+    assert stored.health_status is HealthStatus.UNAVAILABLE
+    assert stored.quarantined is True
+    assert stored.quarantine_reason == result.reason
+    assert gateway.closed == []
+    assert gateway.released == [f"upstream-{account.id}"]
+
+
+@pytest.mark.asyncio
+async def test_successful_interactive_login_clears_existing_quarantine(database):
+    account = add_account(database, "quarantine-recovered")
+    account.quarantined = True
+    account.quarantine_reason = "previous challenge"
+    account.quarantined_at = account.updated_at
+    account.session_status = SessionStatus.CHALLENGE_REQUIRED
+    account.health_status = HealthStatus.ACTION_REQUIRED
+    database.save_social_account(account)
+    adapter = StubAdapter(challenges={str(account.id)})
+    runner, _, _ = make_runner(database, adapter)
+    runner.load_queue()
+
+    def confirm(prompt: str) -> str:
+        normalized_prompt = prompt.lower()
+        for secret_term in ("contraseña", "password", "token", "cookie", "2fa", "recovery"):
+            assert secret_term not in normalized_prompt
+        adapter.challenges.clear()
+        return ""
+
+    report = await runner.start(operator_confirmation=confirm)
+    stored = database.get_social_account(account.id)
+
+    assert report.successful_logins == 1
+    assert stored is not None
+    assert stored.session_status is SessionStatus.VALID
+    assert stored.lifecycle_status is LifecycleStatus.WARMUP
+    assert stored.health_status is HealthStatus.HEALTHY
+    assert stored.quarantined is False
+    assert stored.quarantine_reason is None
+    assert stored.quarantined_at is None
 
 
 @pytest.mark.asyncio

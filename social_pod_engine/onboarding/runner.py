@@ -13,7 +13,7 @@ from ..adapters.base import BaseSocialAdapter, ChallengeType, ExecutionContext
 from ..domain import HealthStatus, LifecycleStatus, SessionStatus, SocialAccount, utc_now
 from ..persistence import SocialPodDatabase
 from ..registry import AdapterRegistry
-from .contracts import InteractiveBrowser, UpstreamOnboardingGateway
+from .contracts import InteractiveBrowser, UpstreamOnboardingGateway, UpstreamProfileNotFound
 from .models import (
     OnboardingBatchReport,
     OnboardingItemResult,
@@ -215,9 +215,21 @@ class OnboardingRunner:
         operator_confirmation: Callable[[str], str] | None,
     ) -> OnboardingItemResult | None:
         upstream_profile_id = account.upstream_profile_id
+        provisioning_note: str | None = None
         lease: Any | None = None
         browser: InteractiveBrowser | None = None
         try:
+            if upstream_profile_id is not None:
+                try:
+                    await self.upstream.get_profile(upstream_profile_id)
+                except UpstreamProfileNotFound:
+                    stale_profile_id = upstream_profile_id
+                    upstream_profile_id = None
+                    provisioning_note = (
+                        f"linked Camoufox profile {stale_profile_id!r} no longer exists; "
+                        "a new profile was created"
+                    )
+
             if upstream_profile_id is None:
                 self.current_step = OnboardingSessionStep.PROFILE_PROVISIONING
                 upstream_profile_id = await self.upstream.create_profile(account)
@@ -253,16 +265,19 @@ class OnboardingRunner:
             if outcome is OnboardingItemStatus.SUCCESS:
                 self._apply_success(account)
             elif outcome is OnboardingItemStatus.CHALLENGE:
-                self._apply_challenge(account)
+                self._apply_challenge(account, reason)
             else:
                 self._apply_failure(account, reason)
             return OnboardingItemResult(account.id, account.username, outcome, upstream_profile_id, reason)
         except _QueuePaused:
             return None
         except Exception as exc:  # noqa: BLE001 - each account must not abort the batch
-            self._apply_failure(account, str(exc))
+            reason = str(exc)
+            if provisioning_note:
+                reason = f"{provisioning_note}; {reason}"
+            self._apply_failure(account, reason)
             return OnboardingItemResult(
-                account.id, account.username, OnboardingItemStatus.FAILED, upstream_profile_id, str(exc)
+                account.id, account.username, OnboardingItemStatus.FAILED, upstream_profile_id, reason
             )
         finally:
             self.current_step = OnboardingSessionStep.CLOSING
@@ -290,6 +305,8 @@ class OnboardingRunner:
             )
             answer = await asyncio.to_thread(operator_confirmation, message)
             if answer.strip().upper() == "CANCELAR":
+                if challenge is not ChallengeType.NONE:
+                    return OnboardingItemStatus.CHALLENGE, "operator cancelled during challenge verification"
                 return OnboardingItemStatus.FAILED, "operator cancelled interactive login"
             challenge = await adapter.detect_challenge(context)
             status = await adapter.validate_session(context)
@@ -321,21 +338,29 @@ class OnboardingRunner:
         account.session_status = SessionStatus.VALID
         account.lifecycle_status = self.config.successful_lifecycle_status
         account.health_status = HealthStatus.HEALTHY
+        account.quarantined = False
+        account.quarantine_reason = None
+        account.quarantined_at = None
         account.updated_at = utc_now()
         self.database.save_social_account(account)
 
-    def _apply_challenge(self, account: SocialAccount) -> None:
+    def _apply_challenge(self, account: SocialAccount, reason: str | None = None) -> None:
         account.session_status = SessionStatus.CHALLENGE_REQUIRED
         account.lifecycle_status = LifecycleStatus.PENDING_SETUP
         account.health_status = HealthStatus.ACTION_REQUIRED
+        account.quarantined = True
+        account.quarantine_reason = reason or "challenge requires operator intervention"
+        account.quarantined_at = utc_now()
         account.updated_at = utc_now()
         self.database.save_social_account(account)
 
     def _apply_failure(self, account: SocialAccount, reason: str | None) -> None:
-        del reason
-        account.session_status = SessionStatus.CHALLENGE_REQUIRED
+        account.session_status = SessionStatus.UNKNOWN
         account.lifecycle_status = LifecycleStatus.PENDING_SETUP
-        account.health_status = HealthStatus.ACTION_REQUIRED
+        account.health_status = HealthStatus.UNAVAILABLE
+        account.quarantined = True
+        account.quarantine_reason = reason or "onboarding infrastructure failure"
+        account.quarantined_at = utc_now()
         account.updated_at = utc_now()
         self.database.save_social_account(account)
 

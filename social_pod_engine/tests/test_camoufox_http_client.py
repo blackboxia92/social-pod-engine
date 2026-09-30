@@ -10,8 +10,10 @@ from social_pod_engine.integrations.camoufox_http import (
     CamoufoxHttpClient,
     CamoufoxHttpError,
     CamoufoxHttpGateway,
+    CamoufoxHttpNotFound,
     CamoufoxHttpUnavailable,
 )
+from social_pod_engine.onboarding import UpstreamProfileNotFound
 
 
 def _transport(handler):
@@ -151,6 +153,19 @@ async def test_service_unavailable_has_operator_facing_message():
 
     with pytest.raises(CamoufoxHttpUnavailable, match="Start the service"):
         await CamoufoxHttpClient(transport=_transport(handler), retries=0).service_status()
+
+
+@pytest.mark.asyncio
+async def test_gateway_translates_a_missing_profile_to_the_onboarding_contract():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/profiles/stale-profile"
+        return httpx.Response(404, json={"detail": "Profile not found"})
+
+    client = CamoufoxHttpClient(transport=_transport(handler), retries=0)
+    with pytest.raises(CamoufoxHttpNotFound, match="HTTP 404"):
+        await client.get_profile("stale-profile")
+    with pytest.raises(UpstreamProfileNotFound, match="does not exist"):
+        await CamoufoxHttpGateway(client).get_profile("stale-profile")
 
 
 def test_http_client_has_no_upstream_internal_imports():

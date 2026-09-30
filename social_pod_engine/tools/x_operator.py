@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -186,20 +187,22 @@ class XOperator:
 
 
 def main() -> None:
-    runtime = build_runtime()
     try:
+        runtime = build_runtime()
         status = asyncio.run(runtime.camoufox_status())
-    except Exception:
-        status = None
-    if status is None or not status.available:
+        if status is None or not status.available:
+            print(
+                "\nCamoufox Profile Manager no está disponible.\n\nVerificá que el servicio esté iniciado."
+            )
+            return
         print(
-            "\nCamoufox Profile Manager no está disponible.\n\nVerificá que el servicio esté iniciado."
+            f"Camoufox: ONLINE | Social Pod DB: OK | Execution: {'REAL' if runtime.config.execution_enabled else 'SAFE'}"
         )
-        return
-    print(
-        f"Camoufox: ONLINE | Social Pod DB: OK | Execution: {'REAL' if runtime.config.execution_enabled else 'SAFE'}"
-    )
-    XOperator(runtime).run()
+        XOperator(runtime).run()
+    except Exception:
+        if os.getenv("SOCIAL_POD_DEBUG", "").lower() == "true":
+            raise
+        print("\nNo se pudo iniciar Social Pod. Verificá la configuración e intentá nuevamente.")
 
 
 if __name__ == "__main__":

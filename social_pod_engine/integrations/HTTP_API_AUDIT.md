@@ -22,25 +22,23 @@ upstream login session or `X-API-Key` when that authentication is enabled.
 | Acquire/release a lease explicitly | — | No |
 | Get a lease token/handle | — | No |
 | Connect to launched browser using CDP/WS | — | No |
-| Obtain a Playwright page/context from a launch | — | No |
+| Launch persistent browser with limited remote page control | `POST /api/v1/profiles/{profile_id}/launch-remote` | Yes |
+| Run allowlisted operation on its live page | `POST /api/v1/profiles/{profile_id}/remote/page` | Yes |
 
 ## Critical boundary finding
 
-`POST /api/v1/profiles/{profile_id}/launch` returns only `profile_id`, a
-deprecated random `browser_session_id` that no endpoint accepts, status,
-message, process ID, and opaque options. It does **not** return a CDP endpoint,
-WebSocket URL, Playwright connection URL, browser-context handle, or page.
+The ordinary launch endpoint still returns no CDP or WebSocket endpoint. The
+new `launch-remote` endpoint instead launches the same persistent profile and
+returns one temporary `http_page_rpc` handle. The authenticated RPC accepts
+only `url`, `goto`, `count`, `fill`, `click`, and `get_attribute`; it never
+returns cookies, storage state, or an unrestricted browser object. Handles are
+profile-bound, in-memory, and invalidated as part of browser close.
 
-Therefore the public API currently cannot satisfy Social Pod's
-`UpstreamOnboardingGateway`, `UpstreamHealthGateway`, or
-`UpstreamExecutionGateway`: all three require a page compatible with
-`ExecutionContext`. `CamoufoxHttpGateway` intentionally exposes only the HTTP
-operations above and does not claim protocol conformance.
+`CamoufoxHttpGateway` adapts that small page surface to the existing
+onboarding, health, and execution gateway protocols. It never imports an
+upstream manager or opens another browser process.
 
 ## Minimum public-API addition needed
 
-Expose a documented, authenticated connection contract as part of launch (or a
-subsequent session endpoint): a short-lived CDP/WebSocket endpoint or a public
-remote-page RPC, tied to the launched profile and with a documented close
-operation. Social Pod can then connect through Playwright without importing
-upstream implementation classes. No fallback to internal managers is valid.
+The public remote-page RPC is now that contract. CDP/WebSocket remains absent
+by design: Camoufox's `launch_server()` cannot serve a persistent context.

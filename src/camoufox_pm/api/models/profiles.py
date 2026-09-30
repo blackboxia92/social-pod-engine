@@ -280,6 +280,33 @@ class ProfileLaunchResponse(BaseModel):
     )
 
 
+class RemoteControlResponse(BaseModel):
+    """Temporary, profile-scoped HTTP page-RPC capability."""
+
+    type: str = "http_page_rpc"
+    endpoint: str
+    handle: str
+    url: str = ""
+
+
+class ProfileRemoteLaunchResponse(BaseModel):
+    profile_id: str
+    status: str
+    message: str
+    process_id: int | None = None
+    remote_control: RemoteControlResponse
+
+
+class RemotePageOperationRequest(BaseModel):
+    operation: str
+    selector: str | None = None
+    value: str | None = None
+
+
+class RemotePageOperationResponse(BaseModel):
+    result: dict[str, Any]
+
+
 class BrowserCloseResponse(BaseModel):
     """Response returned when a browser is asked to close."""
 

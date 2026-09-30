@@ -57,6 +57,66 @@ class CamoufoxLaunch:
     process_id: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class CamoufoxRemoteLaunch(CamoufoxLaunch):
+    handle: str
+    endpoint: str
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class CamoufoxLease:
+    profile_id: str
+    proxy_id: str | None
+
+
+class RemoteLocator:
+    def __init__(self, page: RemotePage, selector: str) -> None:
+        self._page, self._selector = page, selector
+
+    async def count(self) -> int:
+        return int((await self._page._operate("count", selector=self._selector)).get("count", 0))
+
+    async def fill(self, text: str) -> None:
+        await self._page._operate("fill", selector=self._selector, value=text)
+
+    async def click(self) -> None:
+        await self._page._operate("click", selector=self._selector)
+
+    async def get_attribute(self, name: str) -> str | None:
+        value = (await self._page._operate("get_attribute", selector=self._selector, value=name)).get("value")
+        return str(value) if value is not None else None
+
+
+class RemotePage:
+    """Small Playwright-shaped proxy backed by CPM's profile-bound page RPC."""
+
+    def __init__(self, client: CamoufoxHttpClient, remote: CamoufoxRemoteLaunch) -> None:
+        self._client, self._remote = client, remote
+        self.url = remote.url
+
+    def locator(self, selector: str) -> RemoteLocator:
+        return RemoteLocator(self, selector)
+
+    async def goto(self, url: str) -> None:
+        await self._operate("goto", value=url)
+
+    async def _operate(
+        self, operation: str, *, selector: str | None = None, value: str | None = None
+    ) -> dict[str, Any]:
+        result = await self._client.remote_page_operation(
+            self._remote.profile_id,
+            self._remote.handle,
+            operation,
+            selector=selector,
+            value=value,
+        )
+        url = result.get("url")
+        if isinstance(url, str):
+            self.url = url
+        return result
+
+
 class CamoufoxHttpClient:
     """Small async client for confirmed CPM HTTP routes.
 
@@ -140,6 +200,49 @@ class CamoufoxHttpClient:
             process_id=_optional_int(response.get("process_id")),
         )
 
+    async def launch_remote_profile(
+        self, profile_id: str, *, headless: bool = False, window_size: str | None = None
+    ) -> CamoufoxRemoteLaunch:
+        payload: dict[str, Any] = {"headless": headless}
+        if window_size is not None:
+            payload["window_size"] = window_size
+        response = await self._request(
+            "POST", f"{_API_PREFIX}/profiles/{profile_id}/launch-remote", json=payload
+        )
+        remote = response.get("remote_control")
+        if not isinstance(remote, dict) or not all(key in remote for key in ("handle", "endpoint")):
+            raise CamoufoxPageAccessUnavailable("Camoufox did not return a usable remote page handle")
+        return CamoufoxRemoteLaunch(
+            profile_id=str(response.get("profile_id", profile_id)),
+            status=str(response.get("status", "unknown")),
+            message=str(response.get("message", "")),
+            process_id=_optional_int(response.get("process_id")),
+            handle=str(remote["handle"]),
+            endpoint=str(remote["endpoint"]),
+            url=str(remote.get("url", "")),
+        )
+
+    async def remote_page_operation(
+        self,
+        profile_id: str,
+        handle: str,
+        operation: str,
+        *,
+        selector: str | None = None,
+        value: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {"operation": operation, "selector": selector, "value": value}
+        response = await self._request(
+            "POST",
+            f"{_API_PREFIX}/profiles/{profile_id}/remote/page",
+            json=payload,
+            headers={"X-Remote-Control-Handle": handle},
+        )
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise CamoufoxHttpError("Camoufox returned an invalid remote page response")
+        return result
+
     async def close_profile_browser(self, profile_id: str) -> str:
         payload = await self._request("POST", f"{_API_PREFIX}/profiles/{profile_id}/close")
         return str(payload.get("status", "unknown"))
@@ -151,15 +254,18 @@ class CamoufoxHttpClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         attempts = self._retries + 1 if method == "GET" else 1
-        headers = {"X-API-Key": self._api_key} if self._api_key else None
+        request_headers = {"X-API-Key": self._api_key} if self._api_key else {}
+        if headers:
+            request_headers.update(headers)
         for attempt in range(attempts):
             try:
                 async with httpx.AsyncClient(
                     base_url=self._base_url,
                     timeout=self._timeout,
-                    headers=headers,
+                    headers=request_headers or None,
                     transport=self._transport,
                 ) as client:
                     response = await client.request(method, path, params=params, json=json)
@@ -186,12 +292,10 @@ class CamoufoxHttpClient:
 
 
 class CamoufoxHttpGateway:
-    """Public HTTP operations that can be safely composed today.
+    """HTTP implementation of the existing browser gateway protocols.
 
-    It intentionally does *not* implement ``UpstreamOnboardingGateway``,
-    ``UpstreamHealthGateway``, or ``UpstreamExecutionGateway``.  Each requires
-    a Playwright-compatible page, and the current public launch API does not
-    expose a CDP endpoint, WebSocket URL, or remote page handle.
+    CPM remains the sole owner of browser process, persistent context, and
+    lease. Social Pod receives only a temporary, profile-bound page proxy.
     """
 
     def __init__(self, client: CamoufoxHttpClient) -> None:
@@ -206,20 +310,61 @@ class CamoufoxHttpGateway:
     async def get_profile(self, profile_id: str) -> CamoufoxProfile:
         return await self._client.get_profile(profile_id)
 
-    async def create_profile(self, *, name: str, group: str | None = None) -> CamoufoxProfile:
-        return await self._client.create_profile(name=name, group=group)
-
     async def launch_profile(self, profile_id: str, *, headless: bool = False) -> CamoufoxLaunch:
         return await self._client.launch_profile(profile_id, headless=headless)
 
     async def close_profile_browser(self, profile_id: str) -> str:
         return await self._client.close_profile_browser(profile_id)
 
-    def require_playwright_page(self) -> None:
-        raise CamoufoxPageAccessUnavailable(
-            "Camoufox launched the profile, but its public HTTP API does not expose a "
-            "Playwright/CDP connection or page handle."
-        )
+    async def create_profile(self, account: Any) -> str:
+        profile = await self._client.create_profile(name=account.username, group=str(account.group_id) if account.group_id else None)
+        return profile.id
+
+    async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> CamoufoxLease:
+        # CPM takes the actual persistent-profile lease atomically in launch-remote.
+        return CamoufoxLease(upstream_profile_id, proxy_id)
+
+    async def release_lease(self, lease: CamoufoxLease) -> None:
+        # Browser close releases CPM's lease; there is intentionally no separate HTTP unlock.
+        del lease
+
+    async def open_interactive_browser(self, lease: CamoufoxLease):
+        from ..onboarding.contracts import InteractiveBrowser
+
+        remote = await self._client.launch_remote_profile(lease.profile_id, headless=False)
+        return InteractiveBrowser(page=RemotePage(self._client, remote), handle=remote)
+
+    async def close_interactive_browser(self, browser: Any) -> None:
+        await self._client.close_profile_browser(browser.handle.profile_id)
+
+    async def open_headless_browser(self, lease: CamoufoxLease):
+        from ..health.gateway import HeadlessBrowser
+
+        remote = await self._client.launch_remote_profile(lease.profile_id, headless=True)
+        return HeadlessBrowser(page=RemotePage(self._client, remote), handle=remote)
+
+    async def close_headless_browser(self, browser: Any) -> None:
+        await self._client.close_profile_browser(browser.handle.profile_id)
+
+    async def open_browser(self, lease: CamoufoxLease):
+        remote = await self._client.launch_remote_profile(lease.profile_id, headless=False)
+        return _RemoteBrowserHandle(RemotePage(self._client, remote), remote)
+
+    async def close_browser(self, browser: Any) -> None:
+        await self._client.close_profile_browser(browser.remote.profile_id)
+
+    async def check_proxy(self, proxy_id: str | None):
+        from ..health.gateway import ProxyHealthResult
+
+        if proxy_id is None:
+            return ProxyHealthResult(available=True)
+        raise CamoufoxHttpError("CPM public API cannot check a proxy by Social Pod proxy_id")
+
+
+@dataclass(frozen=True, slots=True)
+class _RemoteBrowserHandle:
+    page: RemotePage
+    remote: CamoufoxRemoteLaunch
 
 
 def _profile_from_payload(payload: Any) -> CamoufoxProfile:

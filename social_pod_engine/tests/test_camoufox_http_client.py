@@ -11,7 +11,6 @@ from social_pod_engine.integrations.camoufox_http import (
     CamoufoxHttpError,
     CamoufoxHttpGateway,
     CamoufoxHttpUnavailable,
-    CamoufoxPageAccessUnavailable,
 )
 
 
@@ -50,7 +49,7 @@ async def test_service_status_and_profile_listing_use_public_versioned_routes():
 
 
 @pytest.mark.asyncio
-async def test_launch_and_close_are_sent_once_and_expose_no_page_handle():
+async def test_launch_and_close_are_sent_once():
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -70,8 +69,6 @@ async def test_launch_and_close_are_sent_once_and_expose_no_page_handle():
     assert launch.process_id == 456
     assert close == "closed"
     assert calls == ["/api/v1/profiles/profile-1/launch", "/api/v1/profiles/profile-1/close"]
-    with pytest.raises(CamoufoxPageAccessUnavailable):
-        gateway.require_playwright_page()
 
 
 @pytest.mark.asyncio
@@ -93,6 +90,41 @@ async def test_profile_creation_sends_only_non_secret_identity_fields():
     )
 
     assert profile.id == "profile-2"
+
+
+@pytest.mark.asyncio
+async def test_remote_page_uses_only_the_profile_bound_handle():
+    calls: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        calls.append((request.url.path, payload))
+        if request.url.path.endswith("launch-remote"):
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "type": "http_page_rpc",
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        assert request.headers["x-remote-control-handle"] == "temporary-handle"
+        return httpx.Response(200, json={"result": {"url": "https://x.com/compose"}})
+
+    client = CamoufoxHttpClient(transport=_transport(handler))
+    remote = await client.launch_remote_profile("profile-1")
+    from social_pod_engine.integrations.camoufox_http import RemotePage
+
+    page = RemotePage(client, remote)
+    await page.goto("https://x.com/compose")
+    assert page.url == "https://x.com/compose"
+    assert calls[1][1] == {"operation": "goto", "selector": None, "value": "https://x.com/compose"}
 
 
 @pytest.mark.asyncio

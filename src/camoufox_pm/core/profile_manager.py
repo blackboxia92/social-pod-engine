@@ -972,6 +972,18 @@ class ProfileManager:
             "message": "Browser closed successfully",
         }
 
+    async def open_remote_control(self, profile_id: str):
+        """Return a profile-bound temporary handle for the already-live browser."""
+        return await self.browser_sessions.open_remote_control(profile_id)
+
+    async def remote_page_operation(
+        self, profile_id: str, handle: str, operation: str, *, selector: str | None = None, value: str | None = None
+    ) -> dict[str, Any]:
+        """Delegate an allowlisted page operation without exposing browser internals."""
+        return await self.browser_sessions.remote_page_operation(
+            profile_id, handle, operation, selector=selector, value=value
+        )
+
     async def get_active_browsers(self) -> list[dict[str, Any]]:
         """Return summaries of the browsers currently running."""
         return self.browser_sessions.list_active()

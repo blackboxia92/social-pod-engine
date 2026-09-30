@@ -11,7 +11,9 @@ reliable window-close signal on its own.
 """
 
 import asyncio
+import secrets
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +42,19 @@ class BrowserLaunchError(RuntimeError):
     """Raised when a Camoufox browser fails to launch."""
 
 
+class RemoteControlError(RuntimeError):
+    """A remote page request was not valid for the live browser session."""
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteControlHandle:
+    """An in-memory, profile-bound capability for a live persistent context."""
+
+    profile_id: str
+    handle: str
+    url: str
+
+
 def _resolve_process_id(obj: Any) -> int | None:
     """Best-effort resolution of a driver/browser OS process id.
 
@@ -66,9 +81,14 @@ def _resolve_process_id(obj: Any) -> int | None:
 class BrowserSession:
     """A single running Camoufox browser tied to a profile."""
 
-    def __init__(self, profile_id: str, camoufox: Any, process_id: int | None = None):
+    def __init__(
+        self, profile_id: str, camoufox: Any, process_id: int | None = None, browser: Any = None
+    ):
         self.profile_id = profile_id
         self.camoufox = camoufox  # AsyncCamoufox context manager instance
+        # With persistent_context=True this is Playwright's BrowserContext.
+        # It is deliberately retained here, never recreated by an API request.
+        self.browser = browser
         self.process_id = process_id
         self.started_at = datetime.now()
         self.monitor_task: asyncio.Task | None = None
@@ -127,6 +147,7 @@ class BrowserSessionManager:
 
     def __init__(self, storage: "StorageManager | None" = None, holder: str | None = None) -> None:
         self.active_sessions: dict[str, BrowserSession] = {}
+        self._remote_handles: dict[str, str] = {}
         # Profile id -> how many launches are currently inside camoufox.start().
         # A count rather than a set, because two concurrent launches of one
         # profile both mark it and the first to leave would otherwise clear the
@@ -249,7 +270,7 @@ class BrowserSessionManager:
                 raise BrowserLaunchError(f"Failed to launch browser: {exc}") from exc
 
             process_id = _resolve_process_id(browser) or _resolve_process_id(camoufox)
-            session = BrowserSession(profile_id, camoufox, process_id)
+            session = BrowserSession(profile_id, camoufox, process_id, browser)
             session.on_exit = on_exit
             self.active_sessions[profile_id] = session
         finally:
@@ -288,6 +309,7 @@ class BrowserSessionManager:
         session = self.active_sessions.pop(profile_id, None)
         if session is None:
             return
+        self._invalidate_remote_handles(profile_id)
         await session.terminate()
         # The browser is gone, so the lease must not outlive it. release_lease
         # is guarded on the holder id, so a lease already taken over by another
@@ -304,8 +326,77 @@ class BrowserSessionManager:
         session = self.active_sessions.pop(profile_id, None)
         if session is None:
             return False
+        self._invalidate_remote_handles(profile_id)
         await session.terminate()
         return True
+
+    async def open_remote_control(self, profile_id: str) -> RemoteControlHandle:
+        """Create a temporary capability tied to one already-live profile."""
+        session = self.active_sessions.get(profile_id)
+        if session is None:
+            raise RemoteControlError("browser is not active for this profile")
+        page = await self._page_for(session)
+        handle = secrets.token_urlsafe(32)
+        self._remote_handles[handle] = profile_id
+        return RemoteControlHandle(profile_id, handle, str(getattr(page, "url", "")))
+
+    async def remote_page_operation(
+        self,
+        profile_id: str,
+        handle: str,
+        operation: str,
+        *,
+        selector: str | None = None,
+        value: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a deliberately small set of page operations on the live context."""
+        if self._remote_handles.get(handle) != profile_id:
+            raise RemoteControlError("remote handle is invalid for this profile")
+        session = self.active_sessions.get(profile_id)
+        if session is None:
+            self._remote_handles.pop(handle, None)
+            raise RemoteControlError("browser is not active for this profile")
+        page = await self._page_for(session)
+        if operation == "url":
+            return {"url": str(getattr(page, "url", ""))}
+        if operation == "goto":
+            if not value:
+                raise RemoteControlError("goto requires a URL")
+            await page.goto(value)
+            return {"url": str(getattr(page, "url", ""))}
+        if not selector:
+            raise RemoteControlError(f"{operation} requires a selector")
+        locator = page.locator(selector)
+        if operation == "count":
+            return {"count": await locator.count(), "url": str(getattr(page, "url", ""))}
+        if operation == "fill":
+            if value is None:
+                raise RemoteControlError("fill requires a value")
+            await locator.fill(value)
+            return {"url": str(getattr(page, "url", ""))}
+        if operation == "click":
+            await locator.click()
+            return {"url": str(getattr(page, "url", ""))}
+        if operation == "get_attribute":
+            if not value:
+                raise RemoteControlError("get_attribute requires an attribute name")
+            return {
+                "value": await locator.get_attribute(value),
+                "url": str(getattr(page, "url", "")),
+            }
+        raise RemoteControlError("remote page operation is not allowed")
+
+    @staticmethod
+    async def _page_for(session: BrowserSession) -> Any:
+        pages = getattr(session.browser, "pages", [])
+        return pages[0] if pages else await session.browser.new_page()
+
+    def _invalidate_remote_handles(self, profile_id: str) -> None:
+        self._remote_handles = {
+            handle: bound_profile
+            for handle, bound_profile in self._remote_handles.items()
+            if bound_profile != profile_id
+        }
 
     async def close_and_release(self, profile_id: str) -> bool:
         """Close a browser and hand its lease back, if we still hold it.

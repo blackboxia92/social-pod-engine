@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
 from loguru import logger
 from pydantic import ValidationError
@@ -29,12 +29,16 @@ from camoufox_pm.api.models.profiles import (
     ProfileLaunchRequest,
     ProfileLaunchResponse,
     ProfileListResponse,
+    ProfileRemoteLaunchResponse,
     ProfileResponse,
     ProfileStatsResponse,
     ProfileUpdateRequest,
     ProxyCheckRequest,
     ProxyCheckResponse,
     ReconcileOsRequest,
+    RemoteControlResponse,
+    RemotePageOperationRequest,
+    RemotePageOperationResponse,
 )
 from camoufox_pm.api.models.system import ApiResponse, ExcelImportData
 from camoufox_pm.core import proxy_check
@@ -352,6 +356,70 @@ async def launch_profile(profile_id: str, request: ProfileLaunchRequest):
     except Exception as e:
         logger.error(f"Failed to launch browser for profile {profile_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post(
+    "/profiles/{profile_id}/launch-remote",
+    response_model=ProfileRemoteLaunchResponse,
+    operation_id="launch_profile_remote",
+    summary="Launch a persistent browser with temporary remote page control.",
+)
+async def launch_profile_remote(profile_id: str, request: ProfileLaunchRequest):
+    """Launch the normal persistent profile, then mint one in-memory page handle."""
+    try:
+        manager = get_profile_manager()
+        launched = await manager.launch_browser(
+            profile_id,
+            headless=request.headless,
+            window_size=request.window_size,
+            **request.additional_options or {},
+        )
+        remote = await manager.open_remote_control(profile_id)
+        return ProfileRemoteLaunchResponse(
+            profile_id=profile_id,
+            status=launched.get("status", "launched"),
+            message=launched.get("message", "Browser launched successfully"),
+            process_id=launched.get("process_id"),
+            remote_control=RemoteControlResponse(
+                endpoint=f"/api/v1/profiles/{profile_id}/remote/page",
+                handle=remote.handle,
+                url=remote.url,
+            ),
+        )
+    except ProfileLocked as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"Failed to launch remote browser for profile {profile_id}: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/profiles/{profile_id}/remote/page",
+    response_model=RemotePageOperationResponse,
+    operation_id="remote_profile_page_operation",
+    summary="Run an allowlisted operation on the profile's live persistent page.",
+)
+async def remote_profile_page_operation(
+    profile_id: str,
+    request: RemotePageOperationRequest,
+    x_remote_control_handle: str | None = Header(default=None),
+):
+    if not x_remote_control_handle:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Remote control handle required")
+    try:
+        result = await get_profile_manager().remote_page_operation(
+            profile_id,
+            x_remote_control_handle,
+            request.operation,
+            selector=request.selector,
+            value=request.value,
+        )
+        return RemotePageOperationResponse(result=result)
+    except Exception as exc:
+        # The error reveals no session data and the handle is still scoped by profile id.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post(

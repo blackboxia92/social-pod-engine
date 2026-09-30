@@ -33,8 +33,17 @@ class XAdapter(BaseSocialAdapter):
         "[data-testid='SideNav_AccountSwitcher_Button']",
         "a[data-testid='AppTabBar_Profile_Link']",
     )
-    _composer_selector = "[data-testid='tweetTextarea_0']"
-    _post_button_selector = "[data-testid='tweetButtonInline']"
+    # Ordered, data-testid-first fallbacks; core execution never sees X selectors.
+    _composer_selectors = (
+        "[data-testid='tweetTextarea_0']",
+        "[data-testid='tweetTextarea_0'][contenteditable='true']",
+        "div[role='textbox'][data-testid*='tweetTextarea']",
+    )
+    _post_button_selectors = (
+        "[data-testid='tweetButtonInline']",
+        "[data-testid='tweetButton']",
+        "button[data-testid*='tweetButton']",
+    )
 
     @property
     def platform_name(self) -> str:
@@ -141,18 +150,26 @@ class XAdapter(BaseSocialAdapter):
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("X POST requires non-empty final text")
-        composer: Any = page.locator(self._composer_selector)
-        if not await composer.count():
+        composer = await self._first_locator(page, self._composer_selectors)
+        if composer is None:
             raise ValueError("X post composer is unavailable")
         await composer.fill(text)
-        button: Any = page.locator(self._post_button_selector)
-        if not await button.count():
+        button = await self._first_locator(page, self._post_button_selectors)
+        if button is None:
             raise ValueError("X post button is unavailable")
         await button.click()
         url = getattr(page, "url", "")
         path = urlparse(url).path.strip("/").split("/")
         external_id = path[-1] if len(path) >= 3 and path[-2] == "status" else None
         return ExternalExecutionResult(True, bool(external_id), external_id=external_id, external_url=url or None)
+
+    @staticmethod
+    async def _first_locator(page: SocialPage, selectors: tuple[str, ...]) -> Any | None:
+        for selector in selectors:
+            locator: Any = page.locator(selector)
+            if await locator.count():
+                return locator
+        return None
 
     @staticmethod
     def _page_from(context: ExecutionContext) -> SocialPage:

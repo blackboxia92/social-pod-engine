@@ -218,6 +218,24 @@ class ExecutionTaskStore:
             completed_at=utc_now(),
         )
 
+    def update_payload(self, task_id: UUID, payload: dict[str, object]) -> ExecutionTask:
+        """Attach approved editorial content without changing queue status or executing it."""
+        task = self._required(task_id)
+        if task.status in {TaskStatus.RUNNING, TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            raise InvalidTaskTransition("cannot replace payload after execution lifecycle has started")
+        replacement = ExecutionTask(
+            id=task.id, campaign_id=task.campaign_id, assignment_id=task.assignment_id, account_id=task.account_id,
+            platform=task.platform, capability=task.capability, payload=payload, idempotency_key=task.idempotency_key,
+            scheduled_for=task.scheduled_for, revision=task.revision, status=task.status, approval_status=task.approval_status,
+            attempt_count=task.attempt_count, max_attempts=task.max_attempts, created_at=task.created_at,
+            started_at=task.started_at, completed_at=task.completed_at, last_error=task.last_error, block_reason=task.block_reason,
+            claimed_by=task.claimed_by, claimed_until=task.claimed_until,
+        )
+        with self.database.engine.begin() as connection:
+            connection.execute(update(_tasks).where(_tasks.c.id == str(task.id)).values(payload=replacement.payload))
+            self._event(connection, task.id, "CONTENT_ATTACHED", details={"revision": task.revision})
+        return self._required(task.id)
+
     def fail(self, task_id: UUID, reason: str) -> ExecutionTask:
         task = self._required(task_id)
         target = TaskStatus.READY if task.attempt_count < task.max_attempts else TaskStatus.FAILED

@@ -149,6 +149,14 @@ class NarrativeCampaignStore:
         row = self._get_row(_policies, policy_id)
         return _policy_from_row(row) if row is not None else None
 
+    def get_editorial_policy_for_campaign(self, campaign_id: UUID) -> EditorialPolicy | None:
+        self.initialize()
+        with self.database.engine.connect() as connection:
+            row = connection.execute(
+                select(_policies).where(_policies.c.campaign_id == str(campaign_id)).order_by(_policies.c.id)
+            ).first()
+        return _policy_from_row(row) if row is not None else None
+
     def save_content_brief(self, brief: ContentBrief) -> ContentBrief:
         if self.get_narrative(brief.narrative_id) is None:
             raise KeyError(f"Narrative not found: {brief.narrative_id}")
@@ -176,6 +184,10 @@ class NarrativeCampaignStore:
                 select(_briefs).where(_briefs.c.narrative_id.in_(narrative_ids)).order_by(_briefs.c.role, _briefs.c.id)
             )
             return [_brief_from_row(row) for row in rows]
+
+    def get_content_brief(self, brief_id: UUID) -> ContentBrief | None:
+        row = self._get_row(_briefs, brief_id)
+        return _brief_from_row(row) if row is not None else None
 
     def save_assignment_plan(self, plan: AssignmentPlan) -> AssignmentPlan:
         self._require_campaign(plan.campaign_id)
@@ -230,6 +242,20 @@ class NarrativeCampaignStore:
                 select(_plan_items).where(_plan_items.c.assignment_id == str(assignment_id))
             ).one_or_none()
         return _assignment_from_row(row) if row is not None else None
+
+    def list_assignment_ids(self, campaign_id: UUID, *, group_id: UUID | None = None, role: str | None = None) -> list[UUID]:
+        self.initialize()
+        with self.database.engine.connect() as connection:
+            plan_ids = cast(list[str], connection.execute(select(_plans.c.id).where(_plans.c.campaign_id == str(campaign_id))).scalars().all())
+            if not plan_ids:
+                return []
+            statement = select(_plan_items.c.assignment_id).where(_plan_items.c.plan_id.in_(plan_ids))
+            if group_id is not None:
+                statement = statement.where(_plan_items.c.account_group_id == str(group_id))
+            if role is not None:
+                statement = statement.where(_plan_items.c.role == role)
+            assignment_ids = cast(list[str], connection.execute(statement).scalars().all())
+            return [UUID(value) for value in assignment_ids if value]
 
     def _require_campaign(self, campaign_id: UUID) -> None:
         if self.get_campaign(campaign_id) is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any
@@ -79,7 +80,9 @@ class OnboardingRunner:
         self.store.save(self.state)
         return self.state.total_accounts
 
-    async def start(self) -> OnboardingBatchReport:
+    async def start(
+        self, *, operator_confirmation: Callable[[str], str] | None = None
+    ) -> OnboardingBatchReport:
         state = self._require_state()
         if state.status is OnboardingQueueStatus.PAUSED:
             return self.report()
@@ -90,13 +93,18 @@ class OnboardingRunner:
         state.status = OnboardingQueueStatus.RUNNING
         self.store.save(state)
         while state.status is OnboardingQueueStatus.RUNNING and state.current_account_id is not None:
-            await self.next()
+            await self.next(operator_confirmation=operator_confirmation)
         if state.current_account_id is None:
             state.status = OnboardingQueueStatus.COMPLETED
             self.store.save(state)
         return self.report()
 
-    async def next(self, *, confirm_login: bool = False) -> OnboardingItemResult | None:
+    async def next(
+        self,
+        *,
+        confirm_login: bool = False,
+        operator_confirmation: Callable[[str], str] | None = None,
+    ) -> OnboardingItemResult | None:
         state = self._require_state()
         if state.status is OnboardingQueueStatus.PAUSED:
             return None
@@ -113,7 +121,11 @@ class OnboardingRunner:
                 account_id, "<missing>", OnboardingItemStatus.FAILED, None, "account no longer exists"
             )
         else:
-            result = await self._process_account(account, confirm_login=confirm_login)
+            result = await self._process_account(
+                account,
+                confirm_login=confirm_login,
+                operator_confirmation=operator_confirmation,
+            )
         if result is None:
             self.store.save(state)
             return None
@@ -196,7 +208,11 @@ class OnboardingRunner:
         return OnboardingBatchReport.from_queue(self._require_state())
 
     async def _process_account(
-        self, account: SocialAccount, *, confirm_login: bool
+        self,
+        account: SocialAccount,
+        *,
+        confirm_login: bool,
+        operator_confirmation: Callable[[str], str] | None,
     ) -> OnboardingItemResult | None:
         upstream_profile_id = account.upstream_profile_id
         lease: Any | None = None
@@ -227,7 +243,12 @@ class OnboardingRunner:
             if open_home is None:
                 raise RuntimeError(f"{adapter.platform_name} adapter cannot open its login or home page")
             await open_home(browser.page)
-            outcome, reason = await self._wait_for_session(adapter, context, confirm_login=confirm_login)
+            outcome, reason = await self._wait_for_session(
+                adapter,
+                context,
+                confirm_login=confirm_login,
+                operator_confirmation=operator_confirmation,
+            )
             self.current_step = OnboardingSessionStep.SESSION_VALIDATION
             if outcome is OnboardingItemStatus.SUCCESS:
                 self._apply_success(account)
@@ -252,8 +273,31 @@ class OnboardingRunner:
             self.current_step = None
 
     async def _wait_for_session(
-        self, adapter: BaseSocialAdapter, context: ExecutionContext, *, confirm_login: bool
+        self,
+        adapter: BaseSocialAdapter,
+        context: ExecutionContext,
+        *,
+        confirm_login: bool,
+        operator_confirmation: Callable[[str], str] | None,
     ) -> tuple[OnboardingItemStatus, str | None]:
+        if operator_confirmation is not None:
+            challenge = await adapter.detect_challenge(context)
+            message = (
+                "Se detectó una verificación. Completala en el navegador y luego confirmá aquí.\n"
+                "Presioná Enter cuando hayas terminado el login/verificación, o escribí CANCELAR para salir: "
+                if challenge is not ChallengeType.NONE
+                else "Completá el login en el navegador. Presioná Enter cuando termines, o escribí CANCELAR para salir: "
+            )
+            answer = await asyncio.to_thread(operator_confirmation, message)
+            if answer.strip().upper() == "CANCELAR":
+                return OnboardingItemStatus.FAILED, "operator cancelled interactive login"
+            challenge = await adapter.detect_challenge(context)
+            status = await adapter.validate_session(context)
+            if status is SessionStatus.VALID and challenge is ChallengeType.NONE:
+                return OnboardingItemStatus.SUCCESS, None
+            if challenge is not ChallengeType.NONE or status is SessionStatus.CHALLENGE_REQUIRED:
+                return OnboardingItemStatus.CHALLENGE, "challenge remains after operator confirmation"
+            return OnboardingItemStatus.FAILED, f"session remains {status.value} after operator confirmation"
         timeout = 0.0 if confirm_login else self.config.session_timeout_seconds
         deadline = monotonic() + timeout
         last_status = SessionStatus.UNKNOWN

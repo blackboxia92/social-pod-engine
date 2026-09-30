@@ -102,7 +102,7 @@ class XOperator:
         runner = self.runtime.onboarding
         runner.state = OnboardingQueueState(account_ids=[account.id])
         runner.store.save(runner.state)
-        report = asyncio.run(runner.start())
+        report = asyncio.run(runner.start(operator_confirmation=self.ask))
         current = self.runtime.database.get_social_account(account.id)
         self.say(
             f"Onboarding terminado: {report.successful_logins} válido. Sesión: {current.session_status.value if current else 'unknown'}; salud: {current.health_status.value if current else 'unknown'}; cuarentena: {'SI' if current and current.quarantined else 'NO'}"

@@ -245,6 +245,46 @@ async def test_challenge_and_retry_create_a_new_queue_for_failed_work(database):
 
 
 @pytest.mark.asyncio
+async def test_interactive_confirmation_keeps_browser_open_and_revalidates(database):
+    account = add_account(database, "interactive-challenge")
+    adapter = StubAdapter(challenges={str(account.id)})
+    runner, _, gateway = make_runner(database, adapter)
+    runner.load_queue()
+
+    def confirm(prompt: str) -> str:
+        assert "verificación" in prompt
+        assert gateway.closed == []
+        adapter.challenges.clear()
+        return ""
+
+    report = await runner.start(operator_confirmation=confirm)
+    stored = database.get_social_account(account.id)
+
+    assert report.successful_logins == 1
+    assert stored is not None and stored.session_status is SessionStatus.VALID
+    assert stored.health_status is HealthStatus.HEALTHY
+    assert gateway.closed == [f"upstream-{account.id}"]
+    assert gateway.released == [f"upstream-{account.id}"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_cancel_keeps_account_non_healthy_and_cleans_up(database):
+    account = add_account(database, "interactive-cancel")
+    adapter = StubAdapter(challenges={str(account.id)})
+    runner, _, gateway = make_runner(database, adapter)
+    runner.load_queue()
+
+    report = await runner.start(operator_confirmation=lambda _: "CANCELAR")
+    stored = database.get_social_account(account.id)
+
+    assert report.failed == 1
+    assert stored is not None and stored.session_status is SessionStatus.CHALLENGE_REQUIRED
+    assert stored.health_status is HealthStatus.ACTION_REQUIRED
+    assert gateway.closed == [f"upstream-{account.id}"]
+    assert gateway.released == [f"upstream-{account.id}"]
+
+
+@pytest.mark.asyncio
 async def test_new_runner_resumes_persisted_queue_from_last_saved_index(database):
     first = add_account(database, "first-resume")
     second = add_account(database, "second-resume")

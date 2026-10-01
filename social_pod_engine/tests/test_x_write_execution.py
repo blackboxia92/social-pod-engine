@@ -4,6 +4,7 @@ import pytest
 
 from social_pod_engine.adapters.base import Capability, ExecutionContext, ExternalExecutionResult
 from social_pod_engine.adapters.x import XAdapter
+from social_pod_engine.integrations.camoufox_http import RemoteClickActionabilityError
 
 
 class FakeLocator:
@@ -18,6 +19,13 @@ class FakeLocator:
             "input[name='text']",
             "input[name='password']",
             "[data-testid='loginButton']",
+        ):
+            return 0
+        if self.selector in (
+            "[role='dialog']",
+            "[data-testid='sheetDialog']",
+            "[role='progressbar']",
+            "[data-testid='loadingIndicator']",
         ):
             return 0
         return 1
@@ -68,6 +76,10 @@ class ConfirmationLocator:
             "[data-testid='loginButton']",
         ):
             return 0
+        if self.selector in ("[role='dialog']", "[data-testid='sheetDialog']"):
+            return int(self.page.dialog_visible)
+        if self.selector in ("[role='progressbar']", "[data-testid='loadingIndicator']"):
+            return int(self.page.loading_visible)
         if "error-detail" in self.selector or "[role='alert']" in self.selector:
             return int(self.page.error_visible)
         if "[data-testid='toast']" in self.selector or "[role='status']" in self.selector:
@@ -82,6 +94,7 @@ class ConfirmationLocator:
     async def click(self) -> None:
         if "tweetButton" in self.selector:
             self.page.clicks += 1
+            self.page.clicked_selector = self.selector
             if self.page.clear_composer_on_click:
                 self.page.text = ""
             if self.page.after_click_text is not None:
@@ -109,6 +122,8 @@ class ConfirmationLocator:
         return self.page.button_enabled if "tweetButton" in self.selector else True
 
     async def text_content(self) -> str | None:
+        if self.selector in ("[role='dialog']", "[data-testid='sheetDialog']"):
+            return self.page.dialog_text
         return self.page.text if "tweetTextarea" in self.selector else None
 
 
@@ -123,6 +138,9 @@ class ConfirmationPage:
         clear_composer_on_click: bool = True,
         error_visible: bool = False,
         toast_visible: bool = False,
+        dialog_visible: bool = False,
+        dialog_text: str | None = None,
+        loading_visible: bool = False,
         after_click_text: str | None = None,
     ) -> None:
         self.url = "https://x.com/home"
@@ -130,12 +148,16 @@ class ConfirmationPage:
         self.snapshots = list(snapshots)
         self.direct_status_url = direct_status_url
         self.clicks = 0
+        self.clicked_selector: str | None = None
         self.visited: list[str] = []
         self.button_enabled = button_enabled
         self.button_visible = button_visible
         self.clear_composer_on_click = clear_composer_on_click
         self.error_visible = error_visible
         self.toast_visible = toast_visible
+        self.dialog_visible = dialog_visible
+        self.dialog_text = dialog_text
+        self.loading_visible = loading_visible
         self.after_click_text = after_click_text
 
     def locator(self, selector: str) -> ConfirmationLocator:
@@ -263,6 +285,49 @@ class DiscoveryPage:
                 "text": "",
             },
         ]
+
+
+class ButtonAuditPage(ConfirmationPage):
+    def __init__(self, *args, button_states: dict[str, dict], **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.button_states = button_states
+
+    async def locator_diagnostics(self, selector: str) -> dict:
+        state = self.button_states.get(selector, {"count": 0, "items": []})
+        return state
+
+
+class ActionabilityLocator(ConfirmationLocator):
+    async def click(self) -> None:
+        if "tweetButton" in self.selector:
+            raise RemoteClickActionabilityError("TimeoutError: element did not receive events")
+        await super().click()
+
+
+class ActionabilityPage(ConfirmationPage):
+    def locator(self, selector: str) -> ActionabilityLocator:
+        return ActionabilityLocator(self, selector)
+
+
+def button_state(*, count: int, visible: bool = True, enabled: bool = True, text: str = "Post") -> dict:
+    return {
+        "count": count,
+        "items": [
+            {
+                "tag": "button",
+                "role": "button",
+                "data_testid": "tweetButtonInline",
+                "visible": visible,
+                "enabled": enabled,
+                "bounding_box": visible,
+                "disabled": not enabled,
+                "aria_disabled": "false" if enabled else "true",
+                "text": text,
+            }
+        ]
+        if count
+        else [],
+    }
 
 
 @pytest.mark.asyncio
@@ -507,4 +572,105 @@ async def test_x_post_reports_bounded_dom_diagnostics_when_authenticated_compose
     assert "textboxes=2" in result.metadata["detail"]
     diagnostics = result.metadata["page_diagnostics"]
     assert diagnostics["composer_candidates"][0]["data_testid"] == "SearchBox_Search_Input"
+    assert page.clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_x_post_chooses_one_visible_button_scoped_to_the_active_composer():
+    selectors = XAdapter._post_button_selectors
+    page = ButtonAuditPage(
+        [("Scoped post", "/authenticated/status/scoped")],
+        button_states={
+            selectors[0]: button_state(count=1, visible=True, enabled=True),
+            selectors[1]: button_state(count=1, visible=False, enabled=True),
+            selectors[2]: button_state(count=0),
+        },
+    )
+
+    result = await XAdapter(confirmation_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "Scoped post"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.confirmed is True
+    assert page.clicked_selector == selectors[0]
+    assert result.metadata["post_button"]["count"] == 1
+    assert result.metadata["post_button"]["tag"] == "button"
+    assert len(result.metadata["post_button"]["candidate_selectors"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_x_post_does_not_use_a_button_outside_the_active_composer():
+    selectors = XAdapter._post_button_selectors
+    page = ButtonAuditPage(
+        [],
+        button_states={selector: button_state(count=0) for selector in selectors},
+    )
+
+    result = await XAdapter(submit_ready_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "No global fallback"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "POST_SUBMIT_NOT_STARTED"
+    assert page.clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_x_post_records_visible_error_and_dialog_after_one_click():
+    selectors = XAdapter._post_button_selectors
+    page = ButtonAuditPage(
+        [],
+        clear_composer_on_click=False,
+        error_visible=True,
+        toast_visible=True,
+        button_states={selectors[0]: button_state(count=1)},
+    )
+
+    result = await XAdapter(post_click_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "Rejected by X"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "PLATFORM_REJECTED"
+    assert result.metadata["post_click"]["error"]["visible"] is True
+    assert result.metadata["post_click"]["toast"]["visible"] is True
+    assert page.clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_x_post_records_a_visible_verification_dialog_without_retrying():
+    selectors = XAdapter._post_button_selectors
+    page = ButtonAuditPage(
+        [],
+        clear_composer_on_click=False,
+        dialog_visible=True,
+        dialog_text="Verify your account",
+        button_states={selectors[0]: button_state(count=1)},
+    )
+
+    result = await XAdapter(post_click_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "Needs verification"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "POST_SUBMIT_FAILED"
+    assert result.metadata["post_click"]["dialog"] == {
+        "visible": True,
+        "selector": "[role='dialog']",
+        "text": "Verify your account",
+    }
+    assert page.clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_x_post_treats_a_playwright_actionability_rejection_as_known_pre_submit_failure():
+    page = ActionabilityPage([])
+    result = await XAdapter().execute_capability(
+        Capability.POST, {"text": "No force click"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "POST_SUBMIT_NOT_STARTED"
+    assert result.metadata["post_button"]["actionability"] == "playwright_click_rejected"
     assert page.clicks == 0

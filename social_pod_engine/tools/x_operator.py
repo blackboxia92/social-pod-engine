@@ -188,7 +188,49 @@ class XOperator:
             message = f"❌ NO PUBLICADO\nMotivo: {reason}"
             if failure_detail:
                 message += f"\nDetalle: {failure_detail}"
+            submit_diagnostics = self._latest_submit_diagnostics(current.id)
+            if submit_diagnostics:
+                message += self._format_submit_diagnostics(submit_diagnostics)
             self.say(message)
+
+    def _latest_submit_diagnostics(self, task_id) -> dict[str, object]:
+        queue = getattr(self.runtime, "queue", None)
+        if queue is None:
+            return {}
+        for event in reversed(queue.list_events(task_id)):
+            if event["event_type"] == "POST_SUBMIT_FAILED":
+                return dict(event["details"])
+        return {}
+
+    @staticmethod
+    def _format_submit_diagnostics(details: dict[str, object]) -> str:
+        button = details.get("post_button")
+        post_click = details.get("post_click")
+        if not isinstance(button, dict) and not isinstance(post_click, dict):
+            return ""
+        lines: list[str] = []
+        if isinstance(button, dict):
+            lines.extend(
+                (
+                    f"Button selector: {button.get('selector', '-')}",
+                    f"Button count: {button.get('count', '-')}",
+                    f"Visible: {button.get('visible', '-')}",
+                    f"Enabled: {button.get('enabled', '-')}",
+                    f"Aria-disabled: {button.get('aria_disabled', '-')}",
+                )
+            )
+        if isinstance(post_click, dict):
+            dialog = post_click.get("dialog")
+            error = post_click.get("error")
+            lines.append(f"Dialog: {XOperator._diagnostic_text(dialog)}")
+            lines.append(f"Error: {XOperator._diagnostic_text(error)}")
+        return "\n" + "\n".join(lines)
+
+    @staticmethod
+    def _diagnostic_text(value: object) -> str:
+        if not isinstance(value, dict) or not value.get("visible"):
+            return "no"
+        return str(value.get("text") or "visible")[:120]
 
     @staticmethod
     def _task_failure_message(last_error, block_reason) -> tuple[str, str | None]:

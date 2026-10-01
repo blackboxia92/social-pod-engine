@@ -410,6 +410,37 @@ class BrowserSessionManager:
                 if isinstance(snapshot, dict):
                     items.append(snapshot)
             return {"items": items, "url": str(getattr(page, "url", ""))}
+        if operation == "locator_diagnostics":
+            if not selector:
+                raise RemoteControlError("locator_diagnostics requires a selector")
+            locators = page.locator(selector)
+            count = await locators.count()
+            items = []
+            for index in range(min(count, 4)):
+                locator = locators.nth(index)
+                # Fixed, server-owned projection: callers receive diagnostic
+                # facts only, never a client-supplied browser evaluation.
+                snapshot = await locator.evaluate(
+                    """element => ({
+                        tag: element.tagName.toLowerCase(),
+                        role: element.getAttribute('role'),
+                        data_testid: element.getAttribute('data-testid'),
+                        aria_label: element.getAttribute('aria-label'),
+                        disabled: element.hasAttribute('disabled'),
+                        aria_disabled: element.getAttribute('aria-disabled'),
+                        text: (element.innerText || '').trim().slice(0, 120),
+                    })"""
+                )
+                if isinstance(snapshot, dict):
+                    snapshot["visible"] = bool(await locator.is_visible())
+                    snapshot["enabled"] = bool(await locator.is_enabled())
+                    snapshot["bounding_box"] = (await locator.bounding_box()) is not None
+                    items.append(snapshot)
+            return {
+                "count": count,
+                "items": items,
+                "url": str(getattr(page, "url", "")),
+            }
         if not selector:
             raise RemoteControlError(f"{operation} requires a selector")
         locator = page.locator(selector)
@@ -421,8 +452,19 @@ class BrowserSessionManager:
             await locator.fill(value)
             return {"url": str(getattr(page, "url", ""))}
         if operation == "click":
-            await locator.click()
-            return {"url": str(getattr(page, "url", ""))}
+            try:
+                await locator.click()
+            except Exception as exc:
+                # ``locator.click`` performs Playwright's visibility,
+                # stability, event-receipt and enabled checks.  A failure
+                # here happened before this RPC confirms dispatch, so expose
+                # only a bounded, non-sensitive diagnostic to the caller.
+                return {
+                    "clicked": False,
+                    "actionability_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                    "url": str(getattr(page, "url", "")),
+                }
+            return {"clicked": True, "url": str(getattr(page, "url", ""))}
         if operation == "get_attribute":
             if not value:
                 raise RemoteControlError("get_attribute requires an attribute name")

@@ -242,6 +242,105 @@ async def test_remote_page_reads_only_bounded_element_diagnostics():
 
 
 @pytest.mark.asyncio
+async def test_remote_page_reads_bounded_locator_actionability_diagnostics():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if request.url.path.endswith("launch-remote"):
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "type": "http_page_rpc",
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        assert payload == {
+            "operation": "locator_diagnostics",
+            "selector": "[data-testid='tweetButtonInline']",
+            "value": None,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "url": "https://x.com/home",
+                    "count": 1,
+                    "items": [
+                        {
+                            "tag": "button",
+                            "role": "button",
+                            "data_testid": "tweetButtonInline",
+                            "visible": True,
+                            "enabled": True,
+                            "bounding_box": True,
+                            "disabled": False,
+                            "aria_disabled": "false",
+                            "text": "Post",
+                        }
+                    ],
+                }
+            },
+        )
+
+    client = CamoufoxHttpClient(transport=_transport(handler))
+    remote = await client.launch_remote_profile("profile-1")
+    from social_pod_engine.integrations.camoufox_http import RemotePage
+
+    diagnostics = await RemotePage(client, remote).locator_diagnostics(
+        "[data-testid='tweetButtonInline']"
+    )
+
+    assert diagnostics["count"] == 1
+    assert diagnostics["items"][0]["bounding_box"] is True
+
+
+@pytest.mark.asyncio
+async def test_remote_page_reports_a_known_pre_click_actionability_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("launch-remote"):
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "type": "http_page_rpc",
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "clicked": False,
+                    "actionability_error": "TimeoutError: element did not receive events",
+                    "url": "https://x.com/home",
+                }
+            },
+        )
+
+    client = CamoufoxHttpClient(transport=_transport(handler))
+    remote = await client.launch_remote_profile("profile-1")
+    from social_pod_engine.integrations.camoufox_http import (
+        RemoteClickActionabilityError,
+        RemotePage,
+    )
+
+    with pytest.raises(RemoteClickActionabilityError, match="did not receive events"):
+        await RemotePage(client, remote).locator("[data-testid='tweetButton']").click()
+
+
+@pytest.mark.asyncio
 async def test_http_errors_are_actionable_and_safe_get_retries():
     attempts = 0
 

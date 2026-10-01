@@ -10,6 +10,7 @@ from urllib.parse import urljoin, urlparse
 
 from ..contracts import SocialPage
 from ..domain import HealthStatus, SessionStatus
+from ..integrations.camoufox_http import RemoteClickActionabilityError
 from ..models import AccountProfile, HealthReport, PlatformCapabilities, SessionState
 from .base import (
     BaseSocialAdapter,
@@ -56,16 +57,23 @@ class XAdapter(BaseSocialAdapter):
         # user-facing aria label so it cannot select search or DM inputs.
         "[data-testid='primaryColumn'] div[role='textbox'][contenteditable='true'][aria-label='Post text']",
     )
+    # Pair the button with the active Home composer.  This prevents a hidden
+    # dialog, a reused modal, or another global tweet button from winning a
+    # first-match selector lookup.
     _post_button_selectors = (
+        "[data-testid='primaryColumn']:has([data-testid='tweetTextarea_0']) "
         "[data-testid='tweetButtonInline']",
+        "[data-testid='primaryColumn']:has([data-testid='tweetTextarea_0']) "
         "[data-testid='tweetButton']",
-        "button[data-testid*='tweetButton']",
+        "[role='dialog']:has([data-testid='tweetTextarea_0']) [data-testid='tweetButton']",
     )
     _tweet_container_selector = "article[data-testid='tweet']"
     _tweet_text_selector = "[data-testid='tweetText']"
     _tweet_permalink_selector = "a[href*='/status/']"
     _toast_selectors = ("[data-testid='toast']", "[role='status']")
     _error_selectors = ("[data-testid='error-detail']", "[role='alert']")
+    _dialog_selectors = ("[role='dialog']", "[data-testid='sheetDialog']")
+    _loading_selectors = ("[role='progressbar']", "[data-testid='loadingIndicator']")
     _login_selectors = (
         "input[name='text']",
         "input[name='password']",
@@ -82,6 +90,8 @@ class XAdapter(BaseSocialAdapter):
         submit_ready_poll_interval_seconds: float = 0.2,
         home_ready_timeout_seconds: float = 5.0,
         home_ready_poll_interval_seconds: float = 0.2,
+        post_click_timeout_seconds: float = 1.0,
+        post_click_poll_interval_seconds: float = 0.2,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if confirmation_timeout_seconds < 0:
@@ -96,12 +106,18 @@ class XAdapter(BaseSocialAdapter):
             raise ValueError("home_ready_timeout_seconds must be non-negative")
         if home_ready_poll_interval_seconds <= 0:
             raise ValueError("home_ready_poll_interval_seconds must be positive")
+        if post_click_timeout_seconds < 0:
+            raise ValueError("post_click_timeout_seconds must be non-negative")
+        if post_click_poll_interval_seconds <= 0:
+            raise ValueError("post_click_poll_interval_seconds must be positive")
         self.confirmation_timeout_seconds = confirmation_timeout_seconds
         self.confirmation_poll_interval_seconds = confirmation_poll_interval_seconds
         self.submit_ready_timeout_seconds = submit_ready_timeout_seconds
         self.submit_ready_poll_interval_seconds = submit_ready_poll_interval_seconds
         self.home_ready_timeout_seconds = home_ready_timeout_seconds
         self.home_ready_poll_interval_seconds = home_ready_poll_interval_seconds
+        self.post_click_timeout_seconds = post_click_timeout_seconds
+        self.post_click_poll_interval_seconds = post_click_poll_interval_seconds
         self._sleep = sleep
 
     @property
@@ -241,7 +257,7 @@ class XAdapter(BaseSocialAdapter):
             return self._submit_failure(
                 "POST_SUBMIT_NOT_STARTED", "composer did not retain text after fill", diagnostics
             )
-        button, button_state = await self._wait_for_enabled_post_button(page)
+        button, button_state = await self._wait_for_enabled_post_button(page, composer, text)
         if button is None:
             return self._submit_failure(
                 "POST_SUBMIT_NOT_STARTED", "post button remained disabled", diagnostics
@@ -249,6 +265,11 @@ class XAdapter(BaseSocialAdapter):
         diagnostics["post_button"] = button_state
         try:
             await button.click()
+        except RemoteClickActionabilityError as exc:
+            diagnostics["post_button"]["actionability"] = "playwright_click_rejected"
+            return self._submit_failure(
+                "POST_SUBMIT_NOT_STARTED", f"post button was not actionable: {exc}", diagnostics
+            )
         except Exception as exc:
             # A click RPC can time out after the remote browser receives it.
             # The dispatcher must reconcile rather than replay a possible POST.
@@ -256,6 +277,7 @@ class XAdapter(BaseSocialAdapter):
                 "X POST click outcome is unknown", diagnostics=diagnostics
             ) from exc
         diagnostics["post_button_clicked"] = True
+        diagnostics["post_button"]["actionability"] = "playwright_click_completed"
         immediate = self._status_reference(getattr(page, "url", ""))
         if immediate is not None:
             external_id, external_url = immediate
@@ -267,9 +289,9 @@ class XAdapter(BaseSocialAdapter):
                 metadata=diagnostics,
             )
         try:
-            post_click = await self._post_click_state(page, composer, text)
+            post_click = await self._wait_for_post_click_state(page, composer, text)
             diagnostics["post_click"] = post_click
-            if post_click["error_visible"]:
+            if post_click["error"]["visible"]:
                 return self._submit_failure(
                     "PLATFORM_REJECTED", "X displayed an error state", diagnostics
                 )
@@ -280,7 +302,7 @@ class XAdapter(BaseSocialAdapter):
             if not (
                 post_click["composer_cleared"]
                 or post_click["button_disappeared"]
-                or post_click["toast_visible"]
+                or post_click["toast"]["visible"]
             ):
                 return ExternalExecutionResult(
                     True,
@@ -317,21 +339,83 @@ class XAdapter(BaseSocialAdapter):
             },
         )
 
-    async def _wait_for_enabled_post_button(self, page: SocialPage) -> tuple[Any | None, dict[str, Any]]:
+    async def _wait_for_enabled_post_button(
+        self, page: SocialPage, composer: Any, text: str
+    ) -> tuple[Any | None, dict[str, Any]]:
         deadline = monotonic() + self.submit_ready_timeout_seconds
         state: dict[str, Any] = {"found": False}
         while True:
-            button, selector = await self._first_locator_with_selector(page, self._post_button_selectors)
-            if button is not None:
-                assert selector is not None
-                state = await self._button_state(button, selector)
-                if state["visible"] and state["enabled"]:
-                    return button, state
+            button, state = await self._active_post_button(page)
+            state["composer_text_present"] = self._contains_submitted_text(
+                await self._text_content(composer), text
+            )
+            if (
+                button is not None
+                and state["visible"]
+                and state["enabled"]
+                and state["bounding_box"]
+                and state["composer_text_present"]
+            ):
+                return button, state
             if monotonic() >= deadline:
                 return None, state
             await self._sleep(
                 min(self.submit_ready_poll_interval_seconds, max(0.0, deadline - monotonic()))
             )
+
+    async def _active_post_button(self, page: SocialPage) -> tuple[Any | None, dict[str, Any]]:
+        """Select one visible, enabled button scoped to the live composer only."""
+        candidates = [
+            await self._button_selector_state(page, selector)
+            for selector in self._post_button_selectors
+        ]
+        for state in candidates:
+            if state["count"] != 1 or not state["visible"] or not state["enabled"]:
+                continue
+            return page.locator(str(state["selector"])), {**state, "candidate_selectors": candidates}
+        return None, {
+            "found": False,
+            "count": 0,
+            "visible": False,
+            "enabled": False,
+            "bounding_box": False,
+            "candidate_selectors": candidates,
+        }
+
+    async def _button_selector_state(self, page: SocialPage, selector: str) -> dict[str, Any]:
+        diagnostic_reader = getattr(page, "locator_diagnostics", None)
+        if callable(diagnostic_reader):
+            diagnostic = await diagnostic_reader(selector)
+            count = int(diagnostic.get("count", 0))
+            items = diagnostic.get("items", [])
+            first = items[0] if count == 1 and items else {}
+            return {
+                "found": count > 0,
+                "selector": selector,
+                "count": count,
+                "tag": first.get("tag"),
+                "role": first.get("role"),
+                "data_testid": first.get("data_testid"),
+                "visible": bool(first.get("visible")),
+                "enabled": bool(first.get("enabled")),
+                "bounding_box": bool(first.get("bounding_box")),
+                "disabled": bool(first.get("disabled")),
+                "aria_disabled": first.get("aria_disabled") == "true",
+                "text": self._short_text(first.get("text")),
+            }
+        locator = page.locator(selector)
+        count = await locator.count()
+        if count != 1:
+            return {
+                "found": count > 0,
+                "selector": selector,
+                "count": count,
+                "visible": False,
+                "enabled": False,
+                "bounding_box": False,
+            }
+        state = await self._button_state(locator, selector)
+        return {**state, "count": count, "tag": None, "role": None, "bounding_box": True}
 
     async def _wait_for_home_ready(
         self, page: SocialPage
@@ -414,18 +498,48 @@ class XAdapter(BaseSocialAdapter):
             f" | contenteditables={diagnostics.get('contenteditables', 0)}"
         )
 
+    async def _wait_for_post_click_state(
+        self, page: SocialPage, composer: Any, text: str
+    ) -> dict[str, Any]:
+        deadline = monotonic() + self.post_click_timeout_seconds
+        while True:
+            state = await self._post_click_state(page, composer, text)
+            if (
+                state["composer_cleared"]
+                or state["error"]["visible"]
+                or state["toast"]["visible"]
+                or state["dialog"]["visible"]
+                or monotonic() >= deadline
+            ):
+                return state
+            await self._sleep(
+                min(self.post_click_poll_interval_seconds, max(0.0, deadline - monotonic()))
+            )
+
     async def _post_click_state(
         self, page: SocialPage, composer: Any, text: str
-    ) -> dict[str, bool]:
+    ) -> dict[str, Any]:
         composer_text = await self._text_content(composer)
-        button, _ = await self._first_locator_with_selector(page, self._post_button_selectors)
+        _, button = await self._active_post_button(page)
         return {
             "composer_retained_text": self._contains_submitted_text(composer_text, text),
             "composer_cleared": not (composer_text or "").strip(),
-            "button_disappeared": button is None,
-            "toast_visible": await self._has_any(page, self._toast_selectors),
-            "error_visible": await self._has_any(page, self._error_selectors),
+            "button": button,
+            "button_disappeared": not button["found"],
+            "toast": await self._visible_message(page, self._toast_selectors),
+            "error": await self._visible_message(page, self._error_selectors),
+            "dialog": await self._visible_message(page, self._dialog_selectors),
+            "loading": await self._has_any(page, self._loading_selectors),
+            "url": str(getattr(page, "url", "")),
         }
+
+    async def _visible_message(self, page: SocialPage, selectors: tuple[str, ...]) -> dict[str, Any]:
+        for selector in selectors:
+            locator = page.locator(selector)
+            if not await locator.count() or not await self._is_visible(locator):
+                continue
+            return {"visible": True, "selector": selector, "text": self._short_text(await self._text_content(locator))}
+        return {"visible": False, "selector": None, "text": None}
 
     async def _composer_state(self, composer: Any, selector: str, text: str) -> dict[str, Any]:
         contenteditable = await composer.get_attribute("contenteditable")
@@ -478,6 +592,12 @@ class XAdapter(BaseSocialAdapter):
     @staticmethod
     def _contains_submitted_text(actual: str | None, submitted: str) -> bool:
         return submitted.strip() in (actual or "")
+
+    @staticmethod
+    def _short_text(value: object | None) -> str | None:
+        if value is None:
+            return None
+        return " ".join(str(value).split())[:120] or None
 
     @staticmethod
     def _composer_is_ready(state: Mapping[str, Any]) -> bool:

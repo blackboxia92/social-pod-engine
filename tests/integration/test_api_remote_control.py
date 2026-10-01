@@ -54,6 +54,9 @@ class _Locator:
     async def is_enabled(self) -> bool:
         return True
 
+    async def bounding_box(self) -> dict[str, int]:
+        return {"x": 1, "y": 1, "width": 10, "height": 10}
+
 
 class _Page:
     url = "https://x.com/home"
@@ -130,6 +133,17 @@ async def test_remote_control_is_profile_bound_and_invalidated_on_close(client, 
             "text": "visible post",
         }
     ]
+    locator_diagnostics = await client.post(
+        f"/api/profiles/{first}/remote/page",
+        json={"operation": "locator_diagnostics", "selector": "[data-testid='tweetButton']"},
+        headers=headers,
+    )
+    assert locator_diagnostics.status_code == 200
+    result = locator_diagnostics.json()["result"]
+    assert result["count"] == 1
+    assert result["items"][0]["visible"] is True
+    assert result["items"][0]["enabled"] is True
+    assert result["items"][0]["bounding_box"] is True
     for operation, expected in (
         ("is_visible", True),
         ("is_enabled", True),

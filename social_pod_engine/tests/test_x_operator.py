@@ -143,6 +143,53 @@ def test_operator_shows_safe_detail_for_an_unknown_submit_state():
     assert "Detalle: UNKNOWN_EXTERNAL_STATE" in lines[0]
 
 
+def test_operator_shows_safe_button_and_post_click_diagnostics():
+    task = SimpleNamespace(
+        id=uuid4(),
+        status=TaskStatus.FAILED,
+        last_error="POST_SUBMIT_FAILED: composer retained text after click",
+        block_reason=None,
+    )
+
+    class Dispatcher:
+        async def run_task_async(self, task_id, worker_id):
+            del task_id, worker_id
+            return ExecutionDispatchResult(DispatchOutcome.POST_NOT_CONFIRMED, task)
+
+    class Queue:
+        def list_events(self, task_id):
+            assert task_id == task.id
+            return [
+                {
+                    "event_type": "POST_SUBMIT_FAILED",
+                    "details": {
+                        "post_button": {
+                            "selector": "[data-testid='tweetButtonInline']",
+                            "count": 1,
+                            "visible": True,
+                            "enabled": True,
+                            "aria_disabled": False,
+                        },
+                        "post_click": {
+                            "dialog": {"visible": False},
+                            "error": {"visible": True, "text": "Try again"},
+                        },
+                    },
+                }
+            ]
+
+    lines: list[str] = []
+    runtime = SimpleNamespace(
+        dispatcher=Dispatcher(), queue=Queue(), config=SimpleNamespace(worker_id="operator-worker")
+    )
+    XOperator(runtime, output_fn=lines.append)._execute_prepared_task(task)
+
+    assert "Button count: 1" in lines[0]
+    assert "Enabled: True" in lines[0]
+    assert "Dialog: no" in lines[0]
+    assert "Error: Try again" in lines[0]
+
+
 def test_pending_task_view_recovers_expired_claims_before_displaying_status():
     task = SimpleNamespace(
         id=uuid4(),

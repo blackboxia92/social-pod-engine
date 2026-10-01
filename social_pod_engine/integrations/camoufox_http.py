@@ -57,6 +57,12 @@ class CamoufoxPageAccessUnavailable(CamoufoxHttpError):
     """The public API has launched a browser but exposes no usable page."""
 
 
+class RemoteClickActionabilityError(RuntimeError):
+    """Playwright rejected a click before it could be dispatched."""
+
+    known_pre_execution = True
+
+
 @dataclass(frozen=True, slots=True)
 class CamoufoxServiceStatus:
     available: bool
@@ -110,7 +116,11 @@ class RemoteLocator:
         await self._page._operate("fill", selector=self._selector, value=text)
 
     async def click(self) -> None:
-        await self._page._operate("click", selector=self._selector)
+        result = await self._page._operate("click", selector=self._selector)
+        if result.get("clicked") is False:
+            raise RemoteClickActionabilityError(
+                str(result.get("actionability_error") or "locator was not actionable")
+            )
 
     async def get_attribute(self, name: str) -> str | None:
         value = (await self._page._operate("get_attribute", selector=self._selector, value=name)).get("value")
@@ -216,6 +226,22 @@ class RemotePage:
         if isinstance(url, str):
             self.url = url
         return snapshots
+
+    async def locator_diagnostics(self, selector: str) -> dict[str, Any]:
+        """Read bounded actionability evidence for one fixed selector."""
+        result = await self._operate_remote("locator_diagnostics", selector=selector)
+        count = result.get("count")
+        items = result.get("items")
+        if not isinstance(count, int) or not isinstance(items, list):
+            raise CamoufoxHttpError(
+                "Camoufox returned invalid locator diagnostics",
+                operation="remote_page_operation:locator_diagnostics",
+                endpoint=self._remote.endpoint,
+            )
+        url = result.get("url")
+        if isinstance(url, str):
+            self.url = url
+        return {"count": count, "items": [item for item in items if isinstance(item, dict)]}
 
     async def _operate(
         self, operation: str, *, selector: str | None = None, value: str | None = None

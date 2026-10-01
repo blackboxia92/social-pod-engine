@@ -1,11 +1,23 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "SOCIAL_POD_EXECUTION_ENABLED=false"
 
 echo.
+echo ==================================================
+echo SOCIAL POD - MODO REAL
+echo ==================================================
+echo.
+echo ADVERTENCIA:
+echo Este modo puede ejecutar publicaciones reales
+echo en cuentas conectadas.
+echo.
+set /p "SOCIAL_POD_CONFIRMACION=Escribi REAL para continuar. Cualquier otro valor cancelara: "
+if /i not "%SOCIAL_POD_CONFIRMACION%"=="REAL" goto :cancelled
+
+set "SOCIAL_POD_EXECUTION_ENABLED=true"
+echo.
 echo Social Pod iniciando...
-echo Modo: SAFE
+echo Modo: REAL
 call :detect_python
 if errorlevel 1 goto :python_missing
 
@@ -13,11 +25,11 @@ echo Python: OK
 "%SOCIAL_POD_PYTHON%" -c "import sqlalchemy, camoufox_pm, social_pod_engine" >nul 2>&1
 if errorlevel 1 goto :dependencies_missing
 
-"%SOCIAL_POD_PYTHON%" -m social_pod_engine.tools.windows_launcher --mode safe
+"%SOCIAL_POD_PYTHON%" -m social_pod_engine.tools.windows_launcher --mode real
 set "SOCIAL_POD_EXIT=%ERRORLEVEL%"
 if not "%SOCIAL_POD_EXIT%"=="0" (
   echo.
-  echo Social Pod no pudo iniciarse. Revisá el mensaje anterior.
+  echo Social Pod no pudo iniciarse. Revisa el mensaje anterior.
 )
 goto :end
 
@@ -43,16 +55,21 @@ for /f "delims=" %%P in ('where python 2^>nul') do (
 )
 exit /b 1
 
+:cancelled
+echo.
+echo Inicio cancelado. No se habilito ejecucion real.
+goto :end
+
 :python_missing
 echo.
 echo Python no esta instalado o no esta disponible.
-echo Instalá Python 3.10 o superior y ejecutá este archivo nuevamente.
+echo Instala Python 3.10 o superior y ejecuta este archivo nuevamente.
 goto :end
 
 :dependencies_missing
 echo.
 echo Faltan componentes de Social Pod.
-echo Hacé doble clic en INSTALL_SOCIAL_POD.cmd una sola vez y luego volvé a intentar.
+echo Hace doble clic en INSTALL_SOCIAL_POD.cmd una sola vez y luego volve a intentar.
 
 :end
 echo.

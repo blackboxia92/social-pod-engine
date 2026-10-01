@@ -4,8 +4,6 @@ from pathlib import Path
 from urllib.error import URLError
 
 import pytest
-
-from social_pod_engine.runtime import RuntimeConfig
 from social_pod_engine.tools import windows_launcher
 
 
@@ -15,7 +13,9 @@ def test_repository_root_resolves_the_checkout() -> None:
     assert root == Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("script_name", ["START_SOCIAL_POD.cmd", "INSTALL_SOCIAL_POD.cmd"])
+@pytest.mark.parametrize(
+    "script_name", ["START_SOCIAL_POD.cmd", "START_SOCIAL_POD_REAL.cmd", "INSTALL_SOCIAL_POD.cmd"]
+)
 def test_windows_scripts_resolve_their_own_folder_and_prefer_py(script_name: str) -> None:
     script = (windows_launcher.repository_root() / script_name).read_text(encoding="utf-8")
     assert 'cd /d "%~dp0"' in script
@@ -23,9 +23,36 @@ def test_windows_scripts_resolve_their_own_folder_and_prefer_py(script_name: str
     assert "WindowsApps" in script
 
 
-def test_safe_mode_remains_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SOCIAL_POD_EXECUTION_ENABLED", raising=False)
-    assert RuntimeConfig.from_environment().execution_enabled is False
+def test_safe_mode_explicitly_overrides_an_inherited_real_environment() -> None:
+    environment = windows_launcher.operator_environment(
+        windows_launcher.LaunchMode.SAFE, base={"SOCIAL_POD_EXECUTION_ENABLED": "true"}
+    )
+    assert environment["SOCIAL_POD_EXECUTION_ENABLED"] == "false"
+
+
+def test_real_mode_only_enables_execution_for_the_operator_child() -> None:
+    original = {"UNCHANGED": "yes"}
+    environment = windows_launcher.operator_environment(windows_launcher.LaunchMode.REAL, base=original)
+    assert original == {"UNCHANGED": "yes"}
+    assert environment["SOCIAL_POD_EXECUTION_ENABLED"] == "true"
+
+
+def test_launcher_mode_defaults_to_safe_and_accepts_real() -> None:
+    assert windows_launcher.parse_launch_mode([]) is windows_launcher.LaunchMode.SAFE
+    assert windows_launcher.parse_launch_mode(["--mode", "real"]) is windows_launcher.LaunchMode.REAL
+
+
+def test_safe_script_forces_safe_mode_and_real_script_requires_confirmation() -> None:
+    root = windows_launcher.repository_root()
+    safe = (root / "START_SOCIAL_POD.cmd").read_text(encoding="utf-8")
+    real = (root / "START_SOCIAL_POD_REAL.cmd").read_text(encoding="utf-8")
+    assert 'set "SOCIAL_POD_EXECUTION_ENABLED=false"' in safe
+    assert "windows_launcher --mode safe" in safe
+    assert "Escribi REAL para continuar" in real
+    assert 'if /i not "%SOCIAL_POD_CONFIRMACION%"=="REAL" goto :cancelled' in real
+    assert 'set "SOCIAL_POD_EXECUTION_ENABLED=true"' in real
+    assert "windows_launcher --mode real" in real
+    assert "Inicio cancelado. No se habilito ejecucion real." in real
 
 
 def test_camoufox_is_online_requires_a_healthy_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,3 +155,28 @@ def test_camoufox_command_uses_the_configured_local_port() -> None:
         "--port",
         "8100",
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (windows_launcher.LaunchMode.SAFE, "false"),
+        (windows_launcher.LaunchMode.REAL, "true"),
+    ],
+)
+def test_launch_operator_passes_the_explicit_mode_to_the_child(
+    monkeypatch: pytest.MonkeyPatch, mode: windows_launcher.LaunchMode, expected: str
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 0
+
+    def runner(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    monkeypatch.setenv("SOCIAL_POD_EXECUTION_ENABLED", "true")
+    assert windows_launcher.launch_operator(mode, runner=runner) == 0
+    assert captured["kwargs"]["env"]["SOCIAL_POD_EXECUTION_ENABLED"] == expected

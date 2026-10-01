@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
-
 
 DEFAULT_CAMOUFOX_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_START_TIMEOUT_SECONDS = 30.0
@@ -24,13 +25,22 @@ class LauncherError(RuntimeError):
     """A concise error that can be shown directly to an operator."""
 
 
+class LaunchMode(str, Enum):
+    SAFE = "safe"
+    REAL = "real"
+
+    @property
+    def execution_enabled(self) -> str:
+        return "true" if self is LaunchMode.REAL else "false"
+
+
 @dataclass(frozen=True, slots=True)
 class LauncherConfig:
     camoufox_base_url: str
     timeout_seconds: float
 
     @classmethod
-    def from_environment(cls) -> "LauncherConfig":
+    def from_environment(cls) -> LauncherConfig:
         raw_timeout = os.getenv(
             "SOCIAL_POD_CPM_START_TIMEOUT", str(DEFAULT_START_TIMEOUT_SECONDS)
         )
@@ -156,8 +166,36 @@ def ensure_camoufox_online(
     return True
 
 
-def main() -> int:
+def parse_launch_mode(argv: Sequence[str] | None = None) -> LaunchMode:
+    parser = argparse.ArgumentParser(description="Inicia Social Pod para Windows.")
+    parser.add_argument("--mode", choices=[mode.value for mode in LaunchMode], default=LaunchMode.SAFE.value)
+    return LaunchMode(parser.parse_args(argv).mode)
+
+
+def operator_environment(mode: LaunchMode, *, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Create a child-only environment that cannot inherit a stale REAL setting."""
+    environment = dict(os.environ if base is None else base)
+    environment["SOCIAL_POD_EXECUTION_ENABLED"] = mode.execution_enabled
+    return environment
+
+
+def launch_operator(
+    mode: LaunchMode,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+) -> int:
+    completed = runner(
+        [sys.executable, "-m", "social_pod_engine.tools.x_operator"],
+        cwd=repository_root(),
+        check=False,
+        env=operator_environment(mode),
+    )
+    return completed.returncode
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     try:
+        mode = parse_launch_mode(argv)
         config = LauncherConfig.from_environment()
         started_here = ensure_camoufox_online(
             config,
@@ -174,12 +212,7 @@ def main() -> int:
         print("Camoufox Profile Manager: ONLINE")
     print("Social Pod DB: OK")
     print()
-    completed = subprocess.run(
-        [sys.executable, "-m", "social_pod_engine.tools.x_operator"],
-        cwd=repository_root(),
-        check=False,
-    )
-    return completed.returncode
+    return launch_operator(mode)
 
 
 if __name__ == "__main__":

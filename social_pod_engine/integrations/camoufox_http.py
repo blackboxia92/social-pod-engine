@@ -8,6 +8,7 @@ cannot manufacture the ``page`` required by Social Pod's browser gateways.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -26,6 +27,10 @@ class CamoufoxHttpUnavailable(CamoufoxHttpError):
 
 class CamoufoxHttpNotFound(CamoufoxHttpError):
     """A public Camoufox API resource was confirmed not to exist."""
+
+
+class CamoufoxHttpConflict(CamoufoxHttpError):
+    """The public API rejected an operation because its resource is busy."""
 
 
 class CamoufoxPageAccessUnavailable(CamoufoxHttpError):
@@ -282,6 +287,10 @@ class CamoufoxHttpClient:
 
             if response.is_error:
                 detail = _error_detail(response)
+                if response.status_code == 409:
+                    raise CamoufoxHttpConflict(
+                        f"Camoufox Profile Manager returned HTTP 409: {detail}"
+                    )
                 if response.status_code == 404:
                     raise CamoufoxHttpNotFound(
                         f"Camoufox Profile Manager returned HTTP 404: {detail}"
@@ -308,6 +317,8 @@ class CamoufoxHttpGateway:
 
     def __init__(self, client: CamoufoxHttpClient) -> None:
         self._client = client
+        self._leased_profiles: set[str] = set()
+        self._lease_lock = Lock()
 
     async def service_status(self) -> CamoufoxServiceStatus:
         return await self._client.service_status()
@@ -336,12 +347,22 @@ class CamoufoxHttpGateway:
         return profile.id
 
     async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> CamoufoxLease:
-        # CPM takes the actual persistent-profile lease atomically in launch-remote.
+        from ..execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
+
+        with self._lease_lock:
+            if upstream_profile_id in self._leased_profiles:
+                raise ExecutionGatewayError(
+                    ExecutionGatewayFailureKind.PROFILE_BUSY,
+                    f"Camoufox profile {upstream_profile_id!r} is already in use by this Social Pod runtime",
+                )
+            self._leased_profiles.add(upstream_profile_id)
+        # ``launch-remote`` takes CPM's persistent, cross-process lease atomically.
         return CamoufoxLease(upstream_profile_id, proxy_id)
 
     async def release_lease(self, lease: CamoufoxLease) -> None:
-        # Browser close releases CPM's lease; there is intentionally no separate HTTP unlock.
-        del lease
+        # Browser close releases CPM's lease; this removes only Social Pod's local guard.
+        with self._lease_lock:
+            self._leased_profiles.discard(lease.profile_id)
 
     async def open_interactive_browser(self, lease: CamoufoxLease):
         from ..onboarding.contracts import InteractiveBrowser
@@ -361,11 +382,29 @@ class CamoufoxHttpGateway:
     async def close_headless_browser(self, browser: Any) -> None:
         await self._client.close_profile_browser(browser.handle.profile_id)
 
-    async def open_browser(self, lease: CamoufoxLease):
-        remote = await self._client.launch_remote_profile(lease.profile_id, headless=False)
+    async def open_execution_browser(self, lease: CamoufoxLease):
+        from ..execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
+
+        try:
+            remote = await self._client.launch_remote_profile(lease.profile_id, headless=True)
+        except CamoufoxHttpConflict as exc:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.PROFILE_BUSY,
+                "Camoufox profile is busy; retry after its current browser session closes",
+            ) from exc
+        except (CamoufoxHttpUnavailable, CamoufoxPageAccessUnavailable) as exc:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.RPC_UNAVAILABLE,
+                "Camoufox remote page control is unavailable",
+            ) from exc
+        except CamoufoxHttpError as exc:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.BROWSER_LAUNCH_FAILED,
+                "Camoufox could not launch the execution browser",
+            ) from exc
         return _RemoteBrowserHandle(RemotePage(self._client, remote), remote)
 
-    async def close_browser(self, browser: Any) -> None:
+    async def close_execution_browser(self, browser: Any) -> None:
         await self._client.close_profile_browser(browser.remote.profile_id)
 
     async def check_proxy(self, proxy_id: str | None):

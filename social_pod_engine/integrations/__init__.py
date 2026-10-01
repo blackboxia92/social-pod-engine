@@ -7,6 +7,7 @@ not import, construct, or otherwise depend on upstream implementation classes.
 from .camoufox_http import (
     DEFAULT_CAMOUFOX_BASE_URL,
     CamoufoxHttpClient,
+    CamoufoxHttpConflict,
     CamoufoxHttpError,
     CamoufoxHttpGateway,
     CamoufoxHttpNotFound,
@@ -17,6 +18,7 @@ from .camoufox_http import (
 __all__ = [
     "DEFAULT_CAMOUFOX_BASE_URL",
     "CamoufoxHttpClient",
+    "CamoufoxHttpConflict",
     "CamoufoxHttpError",
     "CamoufoxHttpGateway",
     "CamoufoxHttpNotFound",

@@ -79,6 +79,6 @@ def build_runtime(config: RuntimeConfig | None = None) -> SocialPodRuntime:
         config, database, gateway,
         OnboardingRunner(database, adapters, gateway, config=OnboardingConfig()),
         HealthEngine(database, adapters, gateway, config=HealthEngineConfig(max_concurrency=config.max_concurrency)),
-        ExecutionDispatcher(database, queue, adapters, execution_enabled=config.execution_enabled, gateway=gateway, content_store=drafts),
+        ExecutionDispatcher(database, queue, adapters, execution_enabled=config.execution_enabled, gateway=gateway, content_store=drafts, max_concurrency=config.max_concurrency),
         campaigns, drafts, review, bridge, ApprovedContentTaskLinker(drafts, bridge, queue), queue,
     )

@@ -57,6 +57,11 @@ class DispatchOutcome(str, Enum):
     NO_TASK = "no_task"
     NOT_READY = "not_ready"
     CLAIM_LOST = "claim_lost"
+    PROFILE_BUSY = "profile_busy"
+    BROWSER_LAUNCH_FAILED = "browser_launch_failed"
+    RPC_UNAVAILABLE = "rpc_unavailable"
+    POST_NOT_CONFIRMED = "post_not_confirmed"
+    UNKNOWN_EXTERNAL_STATE = "unknown_external_state"
     WOULD_EXECUTE = "would_execute"
     BLOCKED = "blocked"
 

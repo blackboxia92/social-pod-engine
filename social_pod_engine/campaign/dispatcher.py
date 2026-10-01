@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from uuid import UUID
 
 from ..adapters.base import Capability, ExecutionContext, ExternalExecutionResult
 from ..content.models import ContentDraftStatus
 from ..content.persistence import ContentDraftStore
 from ..domain import SocialPlatform
-from ..execution.gateway import UpstreamExecutionGateway
+from ..execution.gateway import (
+    ExecutionGatewayError,
+    ExecutionGatewayFailureKind,
+    UpstreamExecutionGateway,
+)
 from ..persistence import SocialPodDatabase
 from ..registry import AdapterRegistry
 from .eligibility import ExecutionEligibilityEvaluator, ExecutionEligibilityPolicy
@@ -29,9 +34,12 @@ class ExecutionDispatcher:
         eligibility_policy: ExecutionEligibilityPolicy | None = None,
         gateway: UpstreamExecutionGateway | None = None,
         content_store: ContentDraftStore | None = None,
+        max_concurrency: int = 1,
     ) -> None:
         if execution_enabled and (gateway is None or content_store is None):
             raise ValueError("real execution requires explicit gateway and content store")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least one")
         self.database = database
         self.queue = queue
         self.eligibility = ExecutionEligibilityEvaluator(adapters, eligibility_policy)
@@ -39,6 +47,7 @@ class ExecutionDispatcher:
         self.execution_enabled = execution_enabled
         self.gateway = gateway
         self.content_store = content_store
+        self._execution_semaphore = asyncio.Semaphore(max_concurrency)
 
     def run_once(self, worker_id: str) -> ExecutionDispatchResult:
         if self.execution_enabled:
@@ -89,6 +98,22 @@ class ExecutionDispatcher:
         """Run one explicit task, never selecting another READY task as a fallback."""
         if not self.execution_enabled:
             return self.run_task(task_id, worker_id)
+        async with self._execution_semaphore:
+            return await self._run_real_task_async(task_id, worker_id)
+
+    async def run_tasks_async(
+        self, task_ids: list[UUID], worker_id: str
+    ) -> list[ExecutionDispatchResult]:
+        """Run explicit task ids with the configured execution concurrency limit."""
+        return list(
+            await asyncio.gather(
+                *(self.run_task_async(task_id, worker_id) for task_id in task_ids)
+            )
+        )
+
+    async def _run_real_task_async(
+        self, task_id: UUID, worker_id: str
+    ) -> ExecutionDispatchResult:
         requested = self.queue.get(task_id)
         if requested is None:
             return ExecutionDispatchResult(DispatchOutcome.NO_TASK)
@@ -115,23 +140,46 @@ class ExecutionDispatcher:
         try:
             self.queue.add_event(task.id, "EXECUTION_STARTED")
             lease = await gateway.acquire_lease(account.upstream_profile_id or "", proxy_id=account.proxy_id)
-            browser = await gateway.open_browser(lease)
+            browser = await gateway.open_execution_browser(lease)
             adapter = self.adapters.get("x")
             attempted = True
             self.queue.add_event(task.id, "EXTERNAL_ACTION_ATTEMPTED")
             result = await adapter.execute_capability(Capability.POST, task.payload, ExecutionContext(page=browser.page, social_account_id=str(account.id), upstream_profile_id=account.upstream_profile_id))
             if isinstance(result, ExternalExecutionResult) and result.confirmed:
                 return ExecutionDispatchResult(DispatchOutcome.WOULD_EXECUTE, self.queue.complete_external(task.id, external_id=result.external_id, external_url=result.external_url))
-            return ExecutionDispatchResult(DispatchOutcome.BLOCKED, self.queue.mark_unknown_external(task.id, "external action could not be confirmed"))
+            return ExecutionDispatchResult(
+                DispatchOutcome.POST_NOT_CONFIRMED,
+                self.queue.mark_unknown_external(task.id, "POST_NOT_CONFIRMED"),
+            )
+        except ExecutionGatewayError as exc:
+            return self._gateway_failure(task.id, exc.kind)
         except Exception as exc:
             if attempted:
-                return ExecutionDispatchResult(DispatchOutcome.BLOCKED, self.queue.mark_unknown_external(task.id, f"post-action error: {type(exc).__name__}"))
-            return ExecutionDispatchResult(DispatchOutcome.BLOCKED, self.queue.fail(task.id, f"pre-execution error: {type(exc).__name__}"))
+                return ExecutionDispatchResult(
+                    DispatchOutcome.UNKNOWN_EXTERNAL_STATE,
+                    self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {type(exc).__name__}"),
+                )
+            return ExecutionDispatchResult(
+                DispatchOutcome.BROWSER_LAUNCH_FAILED,
+                self.queue.fail(task.id, f"BROWSER_LAUNCH_FAILED: {type(exc).__name__}"),
+            )
         finally:
-            if browser is not None:
-                await gateway.close_browser(browser)
-            if lease is not None:
-                await gateway.release_lease(lease)
+            try:
+                if browser is not None:
+                    await gateway.close_execution_browser(browser)
+            finally:
+                if lease is not None:
+                    await gateway.release_lease(lease)
+
+    def _gateway_failure(
+        self, task_id: UUID, kind: ExecutionGatewayFailureKind
+    ) -> ExecutionDispatchResult:
+        outcome = {
+            ExecutionGatewayFailureKind.PROFILE_BUSY: DispatchOutcome.PROFILE_BUSY,
+            ExecutionGatewayFailureKind.BROWSER_LAUNCH_FAILED: DispatchOutcome.BROWSER_LAUNCH_FAILED,
+            ExecutionGatewayFailureKind.RPC_UNAVAILABLE: DispatchOutcome.RPC_UNAVAILABLE,
+        }[kind]
+        return ExecutionDispatchResult(outcome, self.queue.fail(task_id, kind.value.upper()))
 
     def reconcile_unknown_task(self, task_id, *, confirmed: bool | None):
         task = self.queue.get(task_id)

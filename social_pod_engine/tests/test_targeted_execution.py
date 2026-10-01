@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
-from social_pod_engine.adapters.base import Capability, ExternalExecutionResult
+from social_pod_engine.adapters.base import Capability, ExecutionContext, ExternalExecutionResult
 from social_pod_engine.adapters.x import XAdapter
 from social_pod_engine.campaign.dispatcher import ExecutionDispatcher
 from social_pod_engine.campaign.execution_persistence import ExecutionTaskStore
@@ -21,6 +22,7 @@ from social_pod_engine.domain import (
     SocialAccount,
     SocialPlatform,
 )
+from social_pod_engine.execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
 from social_pod_engine.persistence import SocialPodDatabase
 from social_pod_engine.registry import AdapterRegistry
 
@@ -50,6 +52,10 @@ class RecordingXAdapter(XAdapter):
             external_url="https://x.com/example/status/confirmed-post",
         )
 
+    async def validate_session(self, context: ExecutionContext) -> SessionStatus:
+        assert context.page is not None
+        return SessionStatus.VALID
+
 
 @dataclass
 class FakeBrowser:
@@ -62,22 +68,43 @@ class FakeExecutionGateway:
         self.opened: list[object] = []
         self.closed: list[object] = []
         self.released: list[object] = []
+        self._leased_profiles: set[str] = set()
+        self.active_profiles: set[str] = set()
+        self.max_active_profiles = 0
+        self.execution_started = asyncio.Event()
+        self.allow_execution = asyncio.Event()
+        self.block_execution_open = False
 
     async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> object:
         del proxy_id
+        if upstream_profile_id in self._leased_profiles:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.PROFILE_BUSY, "profile is already leased"
+            )
+        self._leased_profiles.add(upstream_profile_id)
         self.acquired.append(upstream_profile_id)
         return {"profile": upstream_profile_id}
 
     async def release_lease(self, lease: object) -> None:
         self.released.append(lease)
+        self._leased_profiles.discard(lease["profile"])
 
-    async def open_browser(self, lease: object) -> FakeBrowser:
-        browser = FakeBrowser(page=object())
+    async def open_execution_browser(self, lease: object) -> FakeBrowser:
+        profile_id = lease["profile"]
+        assert profile_id in self._leased_profiles
+        assert profile_id not in self.active_profiles
+        self.active_profiles.add(profile_id)
+        self.max_active_profiles = max(self.max_active_profiles, len(self.active_profiles))
+        browser = FakeBrowser(page=SimpleNamespace(profile_id=profile_id))
         self.opened.append(lease)
+        self.execution_started.set()
+        if self.block_execution_open:
+            await self.allow_execution.wait()
         return browser
 
-    async def close_browser(self, browser: FakeBrowser) -> None:
+    async def close_execution_browser(self, browser: FakeBrowser) -> None:
         self.closed.append(browser)
+        self.active_profiles.discard(browser.page.profile_id)
 
 
 class ApprovedDrafts:
@@ -112,7 +139,9 @@ def _task(account: SocialAccount, *, text: str) -> tuple[ExecutionTask, UUID]:
     return task, draft_id
 
 
-def _dispatcher(database: SocialPodDatabase, *, fail_after_attempt: bool = False):
+def _dispatcher(
+    database: SocialPodDatabase, *, fail_after_attempt: bool = False, max_concurrency: int = 1
+):
     persona = Persona(alias="targeted execution")
     account = SocialAccount(
         persona_id=persona.id,
@@ -143,6 +172,7 @@ def _dispatcher(database: SocialPodDatabase, *, fail_after_attempt: bool = False
         execution_enabled=True,
         gateway=gateway,
         content_store=drafts,  # type: ignore[arg-type]
+        max_concurrency=max_concurrency,
     )
     return dispatcher, queue, adapter, gateway, first, second
 
@@ -175,3 +205,77 @@ async def test_targeted_execution_keeps_unknown_external_state_and_cleans_up(dat
     assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
     assert adapter.executed_texts == ["confirmed preview task"]
     assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_profile_reopens_headless_after_cleanup_and_keeps_session(database):
+    dispatcher, queue, adapter, gateway, first_task, second_task = _dispatcher(database)
+
+    first_result = await dispatcher.run_task_async(second_task.id, "worker-one")
+    second_result = await dispatcher.run_task_async(first_task.id, "worker-two")
+
+    assert first_result.task is not None and first_result.task.status is TaskStatus.COMPLETED
+    assert second_result.task is not None and second_result.task.status is TaskStatus.COMPLETED
+    assert gateway.acquired == ["cpm-targeted-profile", "cpm-targeted-profile"]
+    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 2
+    assert gateway.active_profiles == set()
+    assert await adapter.validate_session(ExecutionContext(page=gateway.closed[-1].page)) is SessionStatus.VALID
+    assert queue.get(first_task.id).status is TaskStatus.COMPLETED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_two_tasks_for_one_profile_return_profile_busy_without_second_browser(database):
+    dispatcher, queue, _, gateway, first_task, second_task = _dispatcher(
+        database, max_concurrency=2
+    )
+    gateway.block_execution_open = True
+    batch = asyncio.create_task(
+        dispatcher.run_tasks_async([first_task.id, second_task.id], "parallel-worker")
+    )
+    await gateway.execution_started.wait()
+    gateway.allow_execution.set()
+    results = await batch
+
+    assert {result.outcome.value for result in results} == {"would_execute", "profile_busy"}
+    assert len(gateway.opened) == 1
+    assert len(gateway.closed) == len(gateway.released) == 1
+    busy_task = next(result.task for result in results if result.outcome.value == "profile_busy")
+    assert busy_task is not None and busy_task.status is TaskStatus.READY
+    assert queue.get(busy_task.id).last_error == "PROFILE_BUSY"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_two_profiles_can_run_with_concurrency_two(database):
+    dispatcher, queue, _, gateway, first_task, _ = _dispatcher(database, max_concurrency=2)
+    persona = Persona(alias="second execution persona")
+    account = SocialAccount(
+        persona_id=persona.id,
+        platform=SocialPlatform.X,
+        username="second-account",
+        upstream_profile_id="cpm-second-profile",
+        health_status=HealthStatus.HEALTHY,
+        session_status=SessionStatus.VALID,
+        lifecycle_status=LifecycleStatus.WARMUP,
+        quota_status=QuotaStatus.AVAILABLE,
+    )
+    database.save_persona(persona)
+    database.save_social_account(account)
+    second_task, second_draft = _task(account, text="second profile task")
+    queue.enqueue(second_task)
+    dispatcher.content_store.texts[second_draft] = "second profile task"  # type: ignore[union-attr]
+    gateway.block_execution_open = True
+    batch = asyncio.create_task(
+        dispatcher.run_tasks_async([first_task.id, second_task.id], "parallel-worker")
+    )
+    await gateway.execution_started.wait()
+    while len(gateway.opened) < 2:
+        await asyncio.sleep(0)
+    gateway.allow_execution.set()
+    results = await batch
+
+    assert all(result.task is not None and result.task.status is TaskStatus.COMPLETED for result in results)
+    assert gateway.max_active_profiles == 2
+    assert {lease["profile"] for lease in gateway.released} == {
+        "cpm-targeted-profile",
+        "cpm-second-profile",
+    }

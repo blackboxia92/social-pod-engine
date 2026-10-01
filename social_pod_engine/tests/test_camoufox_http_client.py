@@ -6,8 +6,10 @@ import pathlib
 import httpx
 import pytest
 
+from social_pod_engine.execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
 from social_pod_engine.integrations.camoufox_http import (
     CamoufoxHttpClient,
+    CamoufoxHttpConflict,
     CamoufoxHttpError,
     CamoufoxHttpGateway,
     CamoufoxHttpNotFound,
@@ -166,6 +168,60 @@ async def test_gateway_translates_a_missing_profile_to_the_onboarding_contract()
         await client.get_profile("stale-profile")
     with pytest.raises(UpstreamProfileNotFound, match="does not exist"):
         await CamoufoxHttpGateway(client).get_profile("stale-profile")
+
+
+@pytest.mark.asyncio
+async def test_execution_gateway_uses_headless_remote_launch_while_onboarding_stays_visible():
+    launch_payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("launch-remote"):
+            launch_payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": f"handle-{len(launch_payloads)}",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        assert request.url.path.endswith("/close")
+        return httpx.Response(200, json={"status": "closed"})
+
+    gateway = CamoufoxHttpGateway(CamoufoxHttpClient(transport=_transport(handler)))
+    execution_lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    execution_browser = await gateway.open_execution_browser(execution_lease)
+    await gateway.close_execution_browser(execution_browser)
+    await gateway.release_lease(execution_lease)
+    onboarding_lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    onboarding_browser = await gateway.open_interactive_browser(onboarding_lease)
+    await gateway.close_interactive_browser(onboarding_browser)
+    await gateway.release_lease(onboarding_lease)
+
+    assert launch_payloads == [{"headless": True}, {"headless": False}]
+
+
+@pytest.mark.asyncio
+async def test_execution_gateway_classifies_conflicting_cpm_profile_lease():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("launch-remote")
+        return httpx.Response(409, json={"detail": "Profile is leased by another holder"})
+
+    client = CamoufoxHttpClient(transport=_transport(handler))
+    with pytest.raises(CamoufoxHttpConflict, match="HTTP 409"):
+        await client.launch_remote_profile("profile-1", headless=True)
+    gateway = CamoufoxHttpGateway(client)
+    lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    with pytest.raises(ExecutionGatewayError) as error:
+        await gateway.open_execution_browser(lease)
+    await gateway.release_lease(lease)
+
+    assert error.value.kind is ExecutionGatewayFailureKind.PROFILE_BUSY
 
 
 def test_http_client_has_no_upstream_internal_imports():

@@ -94,6 +94,35 @@ def test_operator_reports_a_safe_execution_error_without_raising(monkeypatch):
     assert "Ocurrió un error operativo" in lines[1]
 
 
+def test_operator_shows_a_structured_rpc_failure_with_safe_detail():
+    task = SimpleNamespace(
+        id=uuid4(),
+        status=TaskStatus.READY,
+        last_error=(
+            "RPC_UNAVAILABLE | operation=launch_remote_profile | "
+            "endpoint=/api/v1/profiles/profile-1/launch-remote | "
+            "cause=ReadTimeout | detail=timeout waiting for launch-remote"
+        ),
+        block_reason=None,
+    )
+
+    class Dispatcher:
+        async def run_task_async(self, task_id, worker_id):
+            del task_id, worker_id
+            return ExecutionDispatchResult(DispatchOutcome.RPC_UNAVAILABLE, task)
+
+    lines: list[str] = []
+    runtime = SimpleNamespace(dispatcher=Dispatcher(), config=SimpleNamespace(worker_id="operator-worker"))
+    XOperator(runtime, output_fn=lines.append)._execute_prepared_task(task)
+
+    assert lines == [
+        "❌ NO PUBLICADO\nMotivo: RPC_UNAVAILABLE\n"
+        "Detalle: operation=launch_remote_profile | "
+        "endpoint=/api/v1/profiles/profile-1/launch-remote | "
+        "cause=ReadTimeout | detail=timeout waiting for launch-remote"
+    ]
+
+
 def test_pending_task_view_recovers_expired_claims_before_displaying_status():
     task = SimpleNamespace(
         id=uuid4(),

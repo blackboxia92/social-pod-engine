@@ -7,9 +7,12 @@ cannot manufacture the ``page`` required by Social Pod's browser gateways.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -19,6 +22,23 @@ _API_PREFIX = "/api/v1"
 
 class CamoufoxHttpError(RuntimeError):
     """A safe, contextual error returned by the remote public API."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str = "http_request",
+        endpoint: str | None = None,
+        status_code: int | None = None,
+        exception_type: str | None = None,
+        safe_detail: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.endpoint = endpoint
+        self.status_code = status_code
+        self.exception_type = exception_type
+        self.safe_detail = safe_detail or message
 
 
 class CamoufoxHttpUnavailable(CamoufoxHttpError):
@@ -121,9 +141,7 @@ class RemotePage:
     async def locator_snapshots(
         self, selector: str, *, text_selector: str, href_selector: str
     ) -> list[RemoteLocatorSnapshot]:
-        result = await self._client.remote_page_operation(
-            self._remote.profile_id,
-            self._remote.handle,
+        result = await self._operate_remote(
             "locator_snapshots",
             selector=selector,
             text_selector=text_selector,
@@ -131,11 +149,19 @@ class RemotePage:
         )
         items = result.get("items")
         if not isinstance(items, list):
-            raise CamoufoxHttpError("Camoufox returned invalid locator snapshots")
+            raise CamoufoxHttpError(
+                "Camoufox returned invalid locator snapshots",
+                operation="remote_page_operation:locator_snapshots",
+                endpoint=self._remote.endpoint,
+            )
         snapshots: list[RemoteLocatorSnapshot] = []
         for item in items:
             if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not isinstance(item.get("href"), str):
-                raise CamoufoxHttpError("Camoufox returned invalid locator snapshot")
+                raise CamoufoxHttpError(
+                    "Camoufox returned invalid locator snapshot",
+                    operation="remote_page_operation:locator_snapshots",
+                    endpoint=self._remote.endpoint,
+                )
             snapshots.append(RemoteLocatorSnapshot(item["text"], item["href"]))
         url = result.get("url")
         if isinstance(url, str):
@@ -145,17 +171,43 @@ class RemotePage:
     async def _operate(
         self, operation: str, *, selector: str | None = None, value: str | None = None
     ) -> dict[str, Any]:
-        result = await self._client.remote_page_operation(
-            self._remote.profile_id,
-            self._remote.handle,
-            operation,
-            selector=selector,
-            value=value,
-        )
+        result = await self._operate_remote(operation, selector=selector, value=value)
         url = result.get("url")
         if isinstance(url, str):
             self.url = url
         return result
+
+    async def _operate_remote(
+        self,
+        operation: str,
+        *,
+        selector: str | None = None,
+        value: str | None = None,
+        text_selector: str | None = None,
+        href_selector: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return await self._client.remote_page_operation(
+                self._remote.profile_id,
+                self._remote.handle,
+                operation,
+                selector=selector,
+                value=value,
+                text_selector=text_selector,
+                href_selector=href_selector,
+            )
+        except CamoufoxHttpError as exc:
+            from ..execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
+
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.RPC_UNAVAILABLE,
+                "Camoufox remote page operation failed",
+                operation=exc.operation,
+                endpoint=exc.endpoint or self._remote.endpoint,
+                status_code=exc.status_code,
+                exception_type=exc.exception_type or type(exc).__name__,
+                safe_detail=exc.safe_detail,
+            ) from exc
 
 
 class CamoufoxHttpClient:
@@ -171,16 +223,18 @@ class CamoufoxHttpClient:
         base_url: str = DEFAULT_CAMOUFOX_BASE_URL,
         *,
         timeout: float = 10.0,
+        launch_timeout: float = 30.0,
         retries: int = 1,
         api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        if timeout <= 0 or launch_timeout <= 0:
+            raise ValueError("timeouts must be positive")
         if retries < 0:
             raise ValueError("retries cannot be negative")
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._launch_timeout = launch_timeout
         self._retries = retries
         self._api_key = api_key
         self._transport = transport
@@ -248,11 +302,19 @@ class CamoufoxHttpClient:
         if window_size is not None:
             payload["window_size"] = window_size
         response = await self._request(
-            "POST", f"{_API_PREFIX}/profiles/{profile_id}/launch-remote", json=payload
+            "POST",
+            f"{_API_PREFIX}/profiles/{profile_id}/launch-remote",
+            json=payload,
+            operation="launch_remote_profile",
+            timeout=self._launch_timeout,
         )
         remote = response.get("remote_control")
         if not isinstance(remote, dict) or not all(key in remote for key in ("handle", "endpoint")):
-            raise CamoufoxPageAccessUnavailable("Camoufox did not return a usable remote page handle")
+            raise CamoufoxPageAccessUnavailable(
+                "Camoufox did not return a usable remote page handle",
+                operation="launch_remote_profile",
+                endpoint=f"{_API_PREFIX}/profiles/{profile_id}/launch-remote",
+            )
         return CamoufoxRemoteLaunch(
             profile_id=str(response.get("profile_id", profile_id)),
             status=str(response.get("status", "unknown")),
@@ -288,10 +350,15 @@ class CamoufoxHttpClient:
             f"{_API_PREFIX}/profiles/{profile_id}/remote/page",
             json=payload,
             headers={"X-Remote-Control-Handle": handle},
+            operation=f"remote_page_operation:{operation}",
         )
         result = response.get("result")
         if not isinstance(result, dict):
-            raise CamoufoxHttpError("Camoufox returned an invalid remote page response")
+            raise CamoufoxHttpError(
+                "Camoufox returned an invalid remote page response",
+                operation=f"remote_page_operation:{operation}",
+                endpoint=f"{_API_PREFIX}/profiles/{profile_id}/remote/page",
+            )
         return result
 
     async def close_profile_browser(self, profile_id: str) -> str:
@@ -306,6 +373,8 @@ class CamoufoxHttpClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        operation: str = "http_request",
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         attempts = self._retries + 1 if method == "GET" else 1
         request_headers = {"X-API-Key": self._api_key} if self._api_key else {}
@@ -315,37 +384,77 @@ class CamoufoxHttpClient:
             try:
                 async with httpx.AsyncClient(
                     base_url=self._base_url,
-                    timeout=self._timeout,
+                    timeout=self._timeout if timeout is None else timeout,
                     headers=request_headers or None,
                     transport=self._transport,
                 ) as client:
                     response = await client.request(method, path, params=params, json=json)
+            except httpx.TimeoutException as exc:
+                if attempt + 1 < attempts:
+                    continue
+                raise CamoufoxHttpUnavailable(
+                    "Camoufox Profile Manager request timed out",
+                    operation=operation,
+                    endpoint=path,
+                    exception_type=type(exc).__name__,
+                    safe_detail=f"timeout waiting for {path}",
+                ) from exc
+            except httpx.ConnectError as exc:
+                if attempt + 1 < attempts:
+                    continue
+                raise CamoufoxHttpUnavailable(
+                    "Camoufox Profile Manager is not available. Start the service and try again.",
+                    operation=operation,
+                    endpoint=path,
+                    exception_type=type(exc).__name__,
+                    safe_detail=f"connection refused or unavailable at {_safe_host(self._base_url)}",
+                ) from exc
             except httpx.TransportError as exc:
                 if attempt + 1 < attempts:
                     continue
                 raise CamoufoxHttpUnavailable(
-                    "Camoufox Profile Manager is not available. Start the service and try again."
+                    "Camoufox Profile Manager is not available. Start the service and try again.",
+                    operation=operation,
+                    endpoint=path,
+                    exception_type=type(exc).__name__,
+                    safe_detail=f"{type(exc).__name__} while requesting {path}",
                 ) from exc
 
             if response.is_error:
                 detail = _error_detail(response)
                 if response.status_code == 409:
                     raise CamoufoxHttpConflict(
-                        f"Camoufox Profile Manager returned HTTP 409: {detail}"
+                        f"Camoufox Profile Manager returned HTTP 409: {detail}",
+                        operation=operation,
+                        endpoint=path,
+                        status_code=response.status_code,
+                        safe_detail=f"Camoufox returned HTTP 409: {_safe_detail(detail)}",
                     )
                 if response.status_code == 404:
                     raise CamoufoxHttpNotFound(
-                        f"Camoufox Profile Manager returned HTTP 404: {detail}"
+                        f"Camoufox Profile Manager returned HTTP 404: {detail}",
+                        operation=operation,
+                        endpoint=path,
+                        status_code=response.status_code,
+                        safe_detail=f"Camoufox returned HTTP 404: {_safe_detail(detail)}",
                     )
                 raise CamoufoxHttpError(
-                    f"Camoufox Profile Manager returned HTTP {response.status_code}: {detail}"
+                    f"Camoufox Profile Manager returned HTTP {response.status_code}: {detail}",
+                    operation=operation,
+                    endpoint=path,
+                    status_code=response.status_code,
+                    safe_detail=f"Camoufox returned HTTP {response.status_code}: {_safe_detail(detail)}",
                 )
             try:
                 payload = response.json()
             except ValueError as exc:
-                raise CamoufoxHttpError("Camoufox returned a non-JSON API response") from exc
+                raise CamoufoxHttpError(
+                    "Camoufox returned a non-JSON API response", operation=operation, endpoint=path
+                ) from exc
             if not isinstance(payload, dict):
-                raise CamoufoxHttpError("Camoufox returned an invalid API response")
+                raise CamoufoxHttpError(
+                    "Camoufox returned an invalid API response", operation=operation, endpoint=path
+                )
             return payload
         raise AssertionError("unreachable")
 
@@ -357,10 +466,24 @@ class CamoufoxHttpGateway:
     lease. Social Pod receives only a temporary, profile-bound page proxy.
     """
 
-    def __init__(self, client: CamoufoxHttpClient) -> None:
+    def __init__(
+        self,
+        client: CamoufoxHttpClient,
+        *,
+        remote_page_ready_attempts: int = 3,
+        remote_page_ready_delay: float = 0.2,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if remote_page_ready_attempts < 1:
+            raise ValueError("remote_page_ready_attempts must be at least one")
+        if remote_page_ready_delay < 0:
+            raise ValueError("remote_page_ready_delay must be non-negative")
         self._client = client
         self._leased_profiles: set[str] = set()
         self._lease_lock = Lock()
+        self._remote_page_ready_attempts = remote_page_ready_attempts
+        self._remote_page_ready_delay = remote_page_ready_delay
+        self._sleep = sleep
 
     async def service_status(self) -> CamoufoxServiceStatus:
         return await self._client.service_status()
@@ -433,21 +556,71 @@ class CamoufoxHttpGateway:
             raise ExecutionGatewayError(
                 ExecutionGatewayFailureKind.PROFILE_BUSY,
                 "Camoufox profile is busy; retry after its current browser session closes",
+                operation=exc.operation,
+                endpoint=exc.endpoint,
+                status_code=exc.status_code,
+                exception_type=type(exc).__name__,
+                safe_detail=exc.safe_detail,
             ) from exc
         except (CamoufoxHttpUnavailable, CamoufoxPageAccessUnavailable) as exc:
             raise ExecutionGatewayError(
                 ExecutionGatewayFailureKind.RPC_UNAVAILABLE,
                 "Camoufox remote page control is unavailable",
+                operation=exc.operation,
+                endpoint=exc.endpoint,
+                status_code=exc.status_code,
+                exception_type=exc.exception_type or type(exc).__name__,
+                safe_detail=exc.safe_detail,
             ) from exc
         except CamoufoxHttpError as exc:
             raise ExecutionGatewayError(
                 ExecutionGatewayFailureKind.BROWSER_LAUNCH_FAILED,
                 "Camoufox could not launch the execution browser",
+                operation=exc.operation,
+                endpoint=exc.endpoint,
+                status_code=exc.status_code,
+                exception_type=exc.exception_type or type(exc).__name__,
+                safe_detail=exc.safe_detail,
             ) from exc
-        return _RemoteBrowserHandle(RemotePage(self._client, remote), remote)
+        browser = _RemoteBrowserHandle(RemotePage(self._client, remote), remote)
+        try:
+            await self._wait_for_remote_page(browser.page)
+        except Exception:
+            # A successful launch can still race a just-created page RPC.  Never
+            # leave CPM's persistent profile locked if the bounded read-only
+            # readiness probe does not become available.
+            try:
+                await self.close_execution_browser(browser)
+            except CamoufoxHttpError:
+                pass
+            raise
+        return browser
 
     async def close_execution_browser(self, browser: Any) -> None:
         await self._client.close_profile_browser(browser.remote.profile_id)
+
+    async def _wait_for_remote_page(self, page: RemotePage) -> None:
+        from ..execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
+
+        last_error: ExecutionGatewayError | None = None
+        for attempt in range(self._remote_page_ready_attempts):
+            try:
+                await page._operate("url")
+                return
+            except ExecutionGatewayError as exc:
+                last_error = exc
+                if attempt + 1 < self._remote_page_ready_attempts:
+                    await self._sleep(self._remote_page_ready_delay)
+        assert last_error is not None
+        raise ExecutionGatewayError(
+            ExecutionGatewayFailureKind.RPC_UNAVAILABLE,
+            "Camoufox remote page did not become ready",
+            operation="remote_page_readiness",
+            endpoint=last_error.endpoint,
+            status_code=last_error.status_code,
+            exception_type=last_error.exception_type,
+            safe_detail=last_error.safe_detail,
+        ) from last_error
 
     async def check_proxy(self, proxy_id: str | None):
         from ..health.gateway import ProxyHealthResult
@@ -493,3 +666,18 @@ def _error_detail(response: httpx.Response) -> str:
         if isinstance(detail, str):
             return detail
     return response.reason_phrase
+
+
+def _safe_host(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    if parsed.hostname:
+        return f"{parsed.hostname}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
+    return "configured Camoufox endpoint"
+
+
+def _safe_detail(value: str) -> str:
+    """Bound server text before it can reach a task, event, or terminal."""
+    lowered = value.lower()
+    if any(token in lowered for token in ("password", "token", "cookie", "authorization", "credential")):
+        return "Camoufox returned a sensitive error detail; inspect its local service logs."
+    return value.replace("\n", " ").replace("\r", " ")[:300]

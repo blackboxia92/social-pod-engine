@@ -5,7 +5,12 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID
 
-from ..adapters.base import Capability, ExecutionContext, ExternalExecutionResult
+from ..adapters.base import (
+    Capability,
+    ExecutionContext,
+    ExternalActionUncertainError,
+    ExternalExecutionResult,
+)
 from ..content.models import ContentDraftStatus
 from ..content.persistence import ContentDraftStore
 from ..domain import SocialPlatform
@@ -151,8 +156,13 @@ class ExecutionDispatcher:
                 DispatchOutcome.POST_NOT_CONFIRMED,
                 self.queue.mark_unknown_external(task.id, "POST_NOT_CONFIRMED"),
             )
+        except ExternalActionUncertainError as exc:
+            return ExecutionDispatchResult(
+                DispatchOutcome.UNKNOWN_EXTERNAL_STATE,
+                self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {type(exc).__name__}"),
+            )
         except ExecutionGatewayError as exc:
-            return self._gateway_failure(task.id, exc.kind)
+            return self._gateway_failure(task.id, exc)
         except Exception as exc:
             if attempted:
                 return ExecutionDispatchResult(
@@ -172,14 +182,22 @@ class ExecutionDispatcher:
                     await gateway.release_lease(lease)
 
     def _gateway_failure(
-        self, task_id: UUID, kind: ExecutionGatewayFailureKind
+        self, task_id: UUID, error: ExecutionGatewayError
     ) -> ExecutionDispatchResult:
         outcome = {
             ExecutionGatewayFailureKind.PROFILE_BUSY: DispatchOutcome.PROFILE_BUSY,
             ExecutionGatewayFailureKind.BROWSER_LAUNCH_FAILED: DispatchOutcome.BROWSER_LAUNCH_FAILED,
             ExecutionGatewayFailureKind.RPC_UNAVAILABLE: DispatchOutcome.RPC_UNAVAILABLE,
-        }[kind]
-        return ExecutionDispatchResult(outcome, self.queue.fail(task_id, kind.value.upper()))
+        }[error.kind]
+        event = (
+            "REMOTE_PAGE_NOT_READY"
+            if error.operation == "remote_page_readiness"
+            else "EXECUTION_RPC_FAILED"
+            if error.kind is ExecutionGatewayFailureKind.RPC_UNAVAILABLE
+            else "BROWSER_LAUNCH_FAILED"
+        )
+        self.queue.add_event(task_id, event, error.event_details())
+        return ExecutionDispatchResult(outcome, self.queue.fail(task_id, error.task_error()))
 
     def reconcile_unknown_task(self, task_id, *, confirmed: bool | None):
         task = self.queue.get(task_id)

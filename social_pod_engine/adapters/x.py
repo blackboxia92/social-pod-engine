@@ -16,6 +16,7 @@ from .base import (
     ChallengeType,
     ExecutionContext,
     ExecutionResult,
+    ExternalActionUncertainError,
     ExternalExecutionResult,
     HealthSignal,
 )
@@ -177,12 +178,20 @@ class XAdapter(BaseSocialAdapter):
         button = await self._first_locator(page, self._post_button_selectors)
         if button is None:
             raise ValueError("X post button is unavailable")
-        await button.click()
+        try:
+            await button.click()
+        except Exception as exc:
+            # A click RPC can time out after the remote browser receives it.
+            # The dispatcher must reconcile rather than replay a possible POST.
+            raise ExternalActionUncertainError("X POST click outcome is unknown") from exc
         immediate = self._status_reference(getattr(page, "url", ""))
         if immediate is not None:
             external_id, external_url = immediate
             return ExternalExecutionResult(True, True, external_id=external_id, external_url=external_url)
-        confirmed = await self.find_published_post(text, page)
+        try:
+            confirmed = await self.find_published_post(text, page)
+        except Exception as exc:
+            raise ExternalActionUncertainError("X POST confirmation outcome is unknown") from exc
         return confirmed or ExternalExecutionResult(True, False)
 
     async def find_published_post(

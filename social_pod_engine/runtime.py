@@ -26,6 +26,7 @@ class RuntimeConfig:
     execution_enabled: bool = False
     worker_id: str = "x-operator"
     http_timeout: float = 10.0
+    launch_timeout: float = 30.0
     max_concurrency: int = 1
 
     @classmethod
@@ -36,6 +37,7 @@ class RuntimeConfig:
             execution_enabled=os.getenv("SOCIAL_POD_EXECUTION_ENABLED", "false").lower() == "true",
             worker_id=os.getenv("SOCIAL_POD_WORKER_ID", "x-operator"),
             http_timeout=float(os.getenv("SOCIAL_POD_HTTP_TIMEOUT", "10.0")),
+            launch_timeout=float(os.getenv("SOCIAL_POD_CPM_LAUNCH_TIMEOUT", "30.0")),
             max_concurrency=int(os.getenv("SOCIAL_POD_MAX_CONCURRENCY", "1")),
         )
 
@@ -65,7 +67,11 @@ def build_runtime(config: RuntimeConfig | None = None) -> SocialPodRuntime:
     database.initialize()
     adapters = AdapterRegistry()
     adapters.register(XAdapter())
-    client = CamoufoxHttpClient(config.camoufox_base_url, timeout=config.http_timeout)
+    client = CamoufoxHttpClient(
+        config.camoufox_base_url,
+        timeout=config.http_timeout,
+        launch_timeout=config.launch_timeout,
+    )
     gateway = CamoufoxHttpGateway(client)
     campaigns = NarrativeCampaignStore(database)
     campaigns.initialize()

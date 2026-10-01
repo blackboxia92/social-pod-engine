@@ -237,6 +237,9 @@ async def test_execution_gateway_uses_headless_remote_launch_while_onboarding_st
                     },
                 },
             )
+        if request.url.path.endswith("/remote/page"):
+            assert json.loads(request.content)["operation"] == "url"
+            return httpx.Response(200, json={"result": {"url": "https://x.com/home"}})
         assert request.url.path.endswith("/close")
         return httpx.Response(200, json={"status": "closed"})
 
@@ -269,6 +272,158 @@ async def test_execution_gateway_classifies_conflicting_cpm_profile_lease():
     await gateway.release_lease(lease)
 
     assert error.value.kind is ExecutionGatewayFailureKind.PROFILE_BUSY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_type", "expected_detail"),
+    [
+        (httpx.ConnectError("refused"), "ConnectError", "connection refused or unavailable"),
+        (httpx.ReadTimeout("slow"), "ReadTimeout", "timeout waiting for"),
+    ],
+)
+async def test_launch_remote_transport_failures_keep_safe_rpc_context(
+    failure, expected_type: str, expected_detail: str
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise type(failure)(str(failure), request=request)
+
+    gateway = CamoufoxHttpGateway(CamoufoxHttpClient(transport=_transport(handler), retries=0))
+    lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    with pytest.raises(ExecutionGatewayError) as error:
+        await gateway.open_execution_browser(lease)
+    await gateway.release_lease(lease)
+
+    assert error.value.kind is ExecutionGatewayFailureKind.RPC_UNAVAILABLE
+    assert error.value.operation == "launch_remote_profile"
+    assert error.value.endpoint == "/api/v1/profiles/profile-1/launch-remote"
+    assert error.value.exception_type == expected_type
+    assert expected_detail in (error.value.safe_detail or "")
+    assert "handle" not in error.value.task_error().lower()
+
+
+@pytest.mark.asyncio
+async def test_launch_remote_http_500_is_a_structured_browser_launch_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("launch-remote")
+        return httpx.Response(500, json={"detail": "browser startup failed"})
+
+    gateway = CamoufoxHttpGateway(CamoufoxHttpClient(transport=_transport(handler)))
+    lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    with pytest.raises(ExecutionGatewayError) as error:
+        await gateway.open_execution_browser(lease)
+    await gateway.release_lease(lease)
+
+    assert error.value.kind is ExecutionGatewayFailureKind.BROWSER_LAUNCH_FAILED
+    assert error.value.operation == "launch_remote_profile"
+    assert error.value.status_code == 500
+    assert "HTTP 500" in error.value.task_error()
+
+
+@pytest.mark.asyncio
+async def test_rpc_error_context_does_not_persist_sensitive_server_detail():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("launch-remote")
+        return httpx.Response(500, json={"detail": "token=do-not-persist"})
+
+    gateway = CamoufoxHttpGateway(CamoufoxHttpClient(transport=_transport(handler)))
+    lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    with pytest.raises(ExecutionGatewayError) as error:
+        await gateway.open_execution_browser(lease)
+    await gateway.release_lease(lease)
+
+    serialized = error.value.task_error().lower()
+    assert "do-not-persist" not in serialized
+    assert "token=" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_execution_browser_waits_for_a_remote_page_then_reuses_the_ready_page():
+    attempts = 0
+    closed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if request.url.path.endswith("launch-remote"):
+            assert json.loads(request.content) == {"headless": True}
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        if request.url.path.endswith("/remote/page"):
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(409, json={"detail": "page is initializing"})
+            return httpx.Response(200, json={"result": {"url": "https://x.com/home"}})
+        closed.append(request.url.path)
+        return httpx.Response(200, json={"status": "closed"})
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    gateway = CamoufoxHttpGateway(
+        CamoufoxHttpClient(transport=_transport(handler)), sleep=no_wait
+    )
+    lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    browser = await gateway.open_execution_browser(lease)
+    await gateway.close_execution_browser(browser)
+    await gateway.release_lease(lease)
+
+    assert attempts == 2
+    assert closed == ["/api/v1/profiles/profile-1/close"]
+
+
+@pytest.mark.asyncio
+async def test_remote_page_readiness_failure_closes_the_browser_before_releasing_lease():
+    closed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("launch-remote"):
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        if request.url.path.endswith("/remote/page"):
+            raise httpx.ReadTimeout("page RPC timed out", request=request)
+        closed.append(request.url.path)
+        return httpx.Response(200, json={"status": "closed"})
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    gateway = CamoufoxHttpGateway(
+        CamoufoxHttpClient(transport=_transport(handler)),
+        remote_page_ready_attempts=2,
+        sleep=no_wait,
+    )
+    lease = await gateway.acquire_lease("profile-1", proxy_id=None)
+    with pytest.raises(ExecutionGatewayError) as error:
+        await gateway.open_execution_browser(lease)
+    await gateway.release_lease(lease)
+
+    assert error.value.kind is ExecutionGatewayFailureKind.RPC_UNAVAILABLE
+    assert error.value.operation == "remote_page_readiness"
+    assert error.value.endpoint == "/api/v1/profiles/profile-1/remote/page"
+    assert error.value.exception_type == "ReadTimeout"
+    assert closed == ["/api/v1/profiles/profile-1/close"]
 
 
 def test_http_client_has_no_upstream_internal_imports():

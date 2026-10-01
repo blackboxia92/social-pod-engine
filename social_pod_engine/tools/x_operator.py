@@ -180,9 +180,22 @@ class XOperator:
                 "⚠ RESULTADO NO CONFIRMADO\nLa acción pudo haberse enviado. No habrá retry automático."
             )
         else:
-            self.say(
-                f"❌ NO PUBLICADO\nMotivo: {current.last_error or current.block_reason or current.status.value}"
-            )
+            reason, detail = self._task_failure_message(current.last_error, current.block_reason)
+            message = f"❌ NO PUBLICADO\nMotivo: {reason}"
+            if detail:
+                message += f"\nDetalle: {detail}"
+            self.say(message)
+
+    @staticmethod
+    def _task_failure_message(last_error, block_reason) -> tuple[str, str | None]:
+        if not last_error:
+            return str(block_reason or "fallo operativo"), None
+        parts = [part.strip() for part in str(last_error).split("|")]
+        if not parts or not parts[0]:
+            return "fallo operativo", None
+        reason = parts[0]
+        detail = " | ".join(parts[1:]).strip() or None
+        return reason, detail
 
     @staticmethod
     def _safe_operational_reason(exc: Exception) -> str:

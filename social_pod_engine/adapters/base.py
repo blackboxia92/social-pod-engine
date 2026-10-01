@@ -62,6 +62,10 @@ class ExternalExecutionResult:
     reasons: tuple[str, ...] = ()
 
 
+class ExternalActionUncertainError(RuntimeError):
+    """A write may have reached the platform but cannot be confirmed safely."""
+
+
 class CapabilityNotSupported(NotImplementedError):
     def __init__(self, platform_name: str, capability: Capability) -> None:
         self.platform_name = platform_name

@@ -90,6 +90,7 @@ class FakeExecutionGateway:
         self.execution_started = asyncio.Event()
         self.allow_execution = asyncio.Event()
         self.block_execution_open = False
+        self.open_failure: ExecutionGatewayError | None = None
 
     async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> object:
         del proxy_id
@@ -106,6 +107,8 @@ class FakeExecutionGateway:
         self._leased_profiles.discard(lease["profile"])
 
     async def open_execution_browser(self, lease: object) -> FakeBrowser:
+        if self.open_failure is not None:
+            raise self.open_failure
         profile_id = lease["profile"]
         assert profile_id in self._leased_profiles
         assert profile_id not in self.active_profiles
@@ -233,6 +236,33 @@ async def test_targeted_execution_keeps_unknown_external_state_and_cleans_up(dat
 
 
 @pytest.mark.asyncio
+async def test_rpc_failure_before_adapter_execution_stays_retryable_and_keeps_safe_context(database):
+    dispatcher, queue, adapter, gateway, _, preview_task = _dispatcher(database)
+    gateway.open_failure = ExecutionGatewayError(
+        ExecutionGatewayFailureKind.RPC_UNAVAILABLE,
+        "Camoufox remote page control is unavailable",
+        operation="launch_remote_profile",
+        endpoint="/api/v1/profiles/cpm-targeted-profile/launch-remote",
+        exception_type="ReadTimeout",
+        safe_detail="timeout waiting for launch-remote",
+    )
+
+    result = await dispatcher.run_task_async(preview_task.id, "operator")
+    current = queue.get(preview_task.id)
+
+    assert result.outcome.value == "rpc_unavailable"
+    assert current is not None and current.status is TaskStatus.READY
+    assert current.last_error is not None and current.last_error.startswith("RPC_UNAVAILABLE")
+    assert "operation=launch_remote_profile" in current.last_error
+    assert adapter.executed_texts == []
+    assert gateway.closed == []
+    assert len(gateway.released) == 1
+    events = queue.list_events(preview_task.id)
+    rpc_event = next(event for event in events if event["event_type"] == "EXECUTION_RPC_FAILED")
+    assert rpc_event["details"]["exception_type"] == "ReadTimeout"
+
+
+@pytest.mark.asyncio
 async def test_unconfirmed_post_attempt_becomes_unknown_without_a_retry(database):
     dispatcher, queue, adapter, gateway, old_task, preview_task = _dispatcher(
         database, unconfirmed_after_attempt=True
@@ -304,7 +334,7 @@ async def test_two_tasks_for_one_profile_return_profile_busy_without_second_brow
     assert len(gateway.closed) == len(gateway.released) == 1
     busy_task = next(result.task for result in results if result.outcome.value == "profile_busy")
     assert busy_task is not None and busy_task.status is TaskStatus.READY
-    assert queue.get(busy_task.id).last_error == "PROFILE_BUSY"  # type: ignore[union-attr]
+    assert queue.get(busy_task.id).last_error == "PROFILE_BUSY | operation=unknown | detail=profile is already leased"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio

@@ -176,14 +176,18 @@ class XOperator:
                 f"✅ PUBLICADO\nPost ID: {current.external_id}\nURL: {current.external_url}\nTask: COMPLETED"
             )
         elif current.status is TaskStatus.UNKNOWN_EXTERNAL_STATE:
+            detail = f"\nDetalle: {current.last_error}" if current.last_error else ""
             self.say(
-                "⚠ RESULTADO NO CONFIRMADO\nLa acción pudo haberse enviado. No habrá retry automático."
+                "⚠ RESULTADO NO CONFIRMADO\n"
+                f"La acción pudo haberse enviado. No habrá retry automático.{detail}"
             )
         else:
-            reason, detail = self._task_failure_message(current.last_error, current.block_reason)
+            reason, failure_detail = self._task_failure_message(
+                current.last_error, current.block_reason
+            )
             message = f"❌ NO PUBLICADO\nMotivo: {reason}"
-            if detail:
-                message += f"\nDetalle: {detail}"
+            if failure_detail:
+                message += f"\nDetalle: {failure_detail}"
             self.say(message)
 
     @staticmethod

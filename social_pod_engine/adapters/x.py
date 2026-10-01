@@ -1,6 +1,7 @@
 """Read-only X adapter implemented against Playwright-compatible pages."""
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable, Mapping
 from time import monotonic
 from typing import Any
@@ -50,20 +51,30 @@ class XAdapter(BaseSocialAdapter):
     _tweet_container_selector = "article[data-testid='tweet']"
     _tweet_text_selector = "[data-testid='tweetText']"
     _tweet_permalink_selector = "a[href*='/status/']"
+    _toast_selectors = ("[data-testid='toast']", "[role='status']")
+    _error_selectors = ("[data-testid='error-detail']", "[role='alert']")
 
     def __init__(
         self,
         *,
         confirmation_timeout_seconds: float = 8.0,
         confirmation_poll_interval_seconds: float = 0.5,
+        submit_ready_timeout_seconds: float = 3.0,
+        submit_ready_poll_interval_seconds: float = 0.2,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if confirmation_timeout_seconds < 0:
             raise ValueError("confirmation_timeout_seconds must be non-negative")
         if confirmation_poll_interval_seconds <= 0:
             raise ValueError("confirmation_poll_interval_seconds must be positive")
+        if submit_ready_timeout_seconds < 0:
+            raise ValueError("submit_ready_timeout_seconds must be non-negative")
+        if submit_ready_poll_interval_seconds <= 0:
+            raise ValueError("submit_ready_poll_interval_seconds must be positive")
         self.confirmation_timeout_seconds = confirmation_timeout_seconds
         self.confirmation_poll_interval_seconds = confirmation_poll_interval_seconds
+        self.submit_ready_timeout_seconds = submit_ready_timeout_seconds
+        self.submit_ready_poll_interval_seconds = submit_ready_poll_interval_seconds
         self._sleep = sleep
 
     @property
@@ -171,28 +182,208 @@ class XAdapter(BaseSocialAdapter):
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("X POST requires non-empty final text")
-        composer = await self._first_locator(page, self._composer_selectors)
+        diagnostics = self._diagnostics(text, page)
+        composer, composer_selector = await self._first_locator_with_selector(
+            page, self._composer_selectors
+        )
         if composer is None:
-            raise ValueError("X post composer is unavailable")
+            return self._submit_failure(
+                "POST_SUBMIT_NOT_STARTED", "composer was not found", diagnostics
+            )
+        assert composer_selector is not None
+        diagnostics["composer"] = await self._composer_state(composer, composer_selector, text)
+        if not self._composer_is_ready(diagnostics["composer"]):
+            return self._submit_failure(
+                "POST_SUBMIT_NOT_STARTED", "composer was not visible and editable", diagnostics
+            )
         await composer.fill(text)
-        button = await self._first_locator(page, self._post_button_selectors)
+        diagnostics["composer"] = await self._composer_state(composer, composer_selector, text)
+        if not diagnostics["composer"]["text_present"]:
+            return self._submit_failure(
+                "POST_SUBMIT_NOT_STARTED", "composer did not retain text after fill", diagnostics
+            )
+        button, button_state = await self._wait_for_enabled_post_button(page)
         if button is None:
-            raise ValueError("X post button is unavailable")
+            return self._submit_failure(
+                "POST_SUBMIT_NOT_STARTED", "post button remained disabled", diagnostics
+            )
+        diagnostics["post_button"] = button_state
         try:
             await button.click()
         except Exception as exc:
             # A click RPC can time out after the remote browser receives it.
             # The dispatcher must reconcile rather than replay a possible POST.
-            raise ExternalActionUncertainError("X POST click outcome is unknown") from exc
+            raise ExternalActionUncertainError(
+                "X POST click outcome is unknown", diagnostics=diagnostics
+            ) from exc
+        diagnostics["post_button_clicked"] = True
         immediate = self._status_reference(getattr(page, "url", ""))
         if immediate is not None:
             external_id, external_url = immediate
-            return ExternalExecutionResult(True, True, external_id=external_id, external_url=external_url)
+            return ExternalExecutionResult(
+                True,
+                True,
+                external_id=external_id,
+                external_url=external_url,
+                metadata=diagnostics,
+            )
         try:
+            post_click = await self._post_click_state(page, composer, text)
+            diagnostics["post_click"] = post_click
+            if post_click["error_visible"]:
+                return self._submit_failure(
+                    "PLATFORM_REJECTED", "X displayed an error state", diagnostics
+                )
+            if post_click["composer_retained_text"]:
+                return self._submit_failure(
+                    "POST_SUBMIT_FAILED", "composer retained text after click", diagnostics
+                )
+            if not (
+                post_click["composer_cleared"]
+                or post_click["button_disappeared"]
+                or post_click["toast_visible"]
+            ):
+                return ExternalExecutionResult(
+                    True,
+                    False,
+                    metadata={
+                        **diagnostics,
+                        "post_submit_status": "UNKNOWN_EXTERNAL_STATE",
+                        "detail": "click completed but no deterministic post-submit signal was observed",
+                    },
+                )
             confirmed = await self.find_published_post(text, page)
         except Exception as exc:
-            raise ExternalActionUncertainError("X POST confirmation outcome is unknown") from exc
-        return confirmed or ExternalExecutionResult(True, False)
+            raise ExternalActionUncertainError(
+                "X POST confirmation outcome is unknown",
+                action_attempted=True,
+                diagnostics=diagnostics,
+            ) from exc
+        if confirmed is not None:
+            return ExternalExecutionResult(
+                confirmed.success,
+                confirmed.confirmed,
+                external_id=confirmed.external_id,
+                external_url=confirmed.external_url,
+                metadata=diagnostics,
+                reasons=confirmed.reasons,
+            )
+        return ExternalExecutionResult(
+            True,
+            False,
+            metadata={
+                **diagnostics,
+                "post_submit_status": "UNKNOWN_EXTERNAL_STATE",
+                "detail": "click completed but no timeline evidence was observed",
+            },
+        )
+
+    async def _wait_for_enabled_post_button(self, page: SocialPage) -> tuple[Any | None, dict[str, Any]]:
+        deadline = monotonic() + self.submit_ready_timeout_seconds
+        state: dict[str, Any] = {"found": False}
+        while True:
+            button, selector = await self._first_locator_with_selector(page, self._post_button_selectors)
+            if button is not None:
+                assert selector is not None
+                state = await self._button_state(button, selector)
+                if state["visible"] and state["enabled"]:
+                    return button, state
+            if monotonic() >= deadline:
+                return None, state
+            await self._sleep(
+                min(self.submit_ready_poll_interval_seconds, max(0.0, deadline - monotonic()))
+            )
+
+    async def _post_click_state(
+        self, page: SocialPage, composer: Any, text: str
+    ) -> dict[str, bool]:
+        composer_text = await self._text_content(composer)
+        button, _ = await self._first_locator_with_selector(page, self._post_button_selectors)
+        return {
+            "composer_retained_text": self._contains_submitted_text(composer_text, text),
+            "composer_cleared": not (composer_text or "").strip(),
+            "button_disappeared": button is None,
+            "toast_visible": await self._has_any(page, self._toast_selectors),
+            "error_visible": await self._has_any(page, self._error_selectors),
+        }
+
+    async def _composer_state(self, composer: Any, selector: str, text: str) -> dict[str, Any]:
+        contenteditable = await composer.get_attribute("contenteditable")
+        text_content = await self._text_content(composer)
+        return {
+            "found": True,
+            "selector": selector,
+            "visible": await self._is_visible(composer),
+            "enabled": await self._is_enabled(composer),
+            "editable": contenteditable == "true",
+            "text_present": self._contains_submitted_text(text_content, text),
+            "text_length": len(text_content or ""),
+        }
+
+    async def _button_state(self, button: Any, selector: str) -> dict[str, Any]:
+        disabled = await button.get_attribute("disabled")
+        aria_disabled = await button.get_attribute("aria-disabled")
+        return {
+            "found": True,
+            "selector": selector,
+            "visible": await self._is_visible(button),
+            "enabled": await self._is_enabled(button),
+            "disabled": disabled is not None,
+            "aria_disabled": aria_disabled == "true",
+            "data_testid": await button.get_attribute("data-testid"),
+        }
+
+    @staticmethod
+    async def _is_visible(locator: Any) -> bool:
+        method = getattr(locator, "is_visible", None)
+        return bool(await method()) if callable(method) else bool(await locator.count())
+
+    @staticmethod
+    async def _is_enabled(locator: Any) -> bool:
+        method = getattr(locator, "is_enabled", None)
+        if callable(method):
+            return bool(await method())
+        disabled = await locator.get_attribute("disabled")
+        aria_disabled = await locator.get_attribute("aria-disabled")
+        return disabled is None and aria_disabled != "true"
+
+    @staticmethod
+    async def _text_content(locator: Any) -> str | None:
+        method = getattr(locator, "text_content", None)
+        if callable(method):
+            value = await method()
+            return str(value) if value is not None else None
+        return None
+
+    @staticmethod
+    def _contains_submitted_text(actual: str | None, submitted: str) -> bool:
+        return submitted.strip() in (actual or "")
+
+    @staticmethod
+    def _composer_is_ready(state: Mapping[str, Any]) -> bool:
+        return bool(state["visible"] and state["enabled"] and state["editable"])
+
+    @staticmethod
+    def _diagnostics(text: str, page: SocialPage) -> dict[str, Any]:
+        return {
+            "url": str(getattr(page, "url", "")),
+            "text_length": len(text),
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+
+    @staticmethod
+    def _submit_failure(
+        status: str, detail: str, diagnostics: Mapping[str, Any]
+    ) -> ExternalExecutionResult:
+        return ExternalExecutionResult(
+            False,
+            False,
+            metadata={
+                **diagnostics,
+                "post_submit_status": status,
+                "detail": detail,
+            },
+        )
 
     async def find_published_post(
         self, text: str, page: SocialPage
@@ -258,11 +449,18 @@ class XAdapter(BaseSocialAdapter):
 
     @staticmethod
     async def _first_locator(page: SocialPage, selectors: tuple[str, ...]) -> Any | None:
+        locator, _ = await XAdapter._first_locator_with_selector(page, selectors)
+        return locator
+
+    @staticmethod
+    async def _first_locator_with_selector(
+        page: SocialPage, selectors: tuple[str, ...]
+    ) -> tuple[Any | None, str | None]:
         for selector in selectors:
             locator: Any = page.locator(selector)
             if await locator.count():
-                return locator
-        return None
+                return locator, selector
+        return None, None
 
     @staticmethod
     def _page_from(context: ExecutionContext) -> SocialPage:

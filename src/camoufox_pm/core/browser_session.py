@@ -405,6 +405,21 @@ class BrowserSessionManager:
                 "value": await locator.get_attribute(value),
                 "url": str(getattr(page, "url", "")),
             }
+        if operation == "is_visible":
+            return {
+                "value": bool(await locator.is_visible()),
+                "url": str(getattr(page, "url", "")),
+            }
+        if operation == "is_enabled":
+            return {
+                "value": bool(await locator.is_enabled()),
+                "url": str(getattr(page, "url", "")),
+            }
+        if operation == "text_content":
+            return {
+                "value": await locator.text_content(),
+                "url": str(getattr(page, "url", "")),
+            }
         raise RemoteControlError("remote page operation is not allowed")
 
     @staticmethod

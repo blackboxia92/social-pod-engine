@@ -123,6 +123,26 @@ def test_operator_shows_a_structured_rpc_failure_with_safe_detail():
     ]
 
 
+def test_operator_shows_safe_detail_for_an_unknown_submit_state():
+    task = SimpleNamespace(
+        id=uuid4(),
+        status=TaskStatus.UNKNOWN_EXTERNAL_STATE,
+        last_error="UNKNOWN_EXTERNAL_STATE: click completed but no deterministic post-submit signal was observed",
+    )
+
+    class Dispatcher:
+        async def run_task_async(self, task_id, worker_id):
+            del task_id, worker_id
+            return ExecutionDispatchResult(DispatchOutcome.UNKNOWN_EXTERNAL_STATE, task)
+
+    lines: list[str] = []
+    runtime = SimpleNamespace(dispatcher=Dispatcher(), config=SimpleNamespace(worker_id="operator-worker"))
+    XOperator(runtime, output_fn=lines.append)._execute_prepared_task(task)
+
+    assert "RESULTADO NO CONFIRMADO" in lines[0]
+    assert "Detalle: UNKNOWN_EXTERNAL_STATE" in lines[0]
+
+
 def test_pending_task_view_recovers_expired_claims_before_displaying_status():
     task = SimpleNamespace(
         id=uuid4(),

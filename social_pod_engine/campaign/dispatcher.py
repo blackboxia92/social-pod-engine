@@ -150,16 +150,49 @@ class ExecutionDispatcher:
             attempted = True
             self.queue.add_event(task.id, "EXTERNAL_ACTION_ATTEMPTED")
             result = await adapter.execute_capability(Capability.POST, task.payload, ExecutionContext(page=browser.page, social_account_id=str(account.id), upstream_profile_id=account.upstream_profile_id))
+            if isinstance(result, ExternalExecutionResult) and result.metadata.get("post_button_clicked"):
+                self.queue.add_event(
+                    task.id, "POST_BUTTON_CLICKED", self._submit_diagnostics(result.metadata)
+                )
             if isinstance(result, ExternalExecutionResult) and result.confirmed:
                 return ExecutionDispatchResult(DispatchOutcome.WOULD_EXECUTE, self.queue.complete_external(task.id, external_id=result.external_id, external_url=result.external_url))
+            if isinstance(result, ExternalExecutionResult):
+                submit_status = result.metadata.get("post_submit_status")
+                if submit_status in {
+                    "POST_SUBMIT_NOT_STARTED",
+                    "POST_SUBMIT_FAILED",
+                    "PLATFORM_REJECTED",
+                }:
+                    detail = str(result.metadata.get("detail", "post submit failed"))
+                    self.queue.add_event(
+                        task.id, "POST_SUBMIT_FAILED", self._submit_diagnostics(result.metadata)
+                    )
+                    return ExecutionDispatchResult(
+                        DispatchOutcome.POST_NOT_CONFIRMED,
+                        self.queue.fail(task.id, f"{submit_status}: {detail}"),
+                    )
+                if submit_status == "UNKNOWN_EXTERNAL_STATE":
+                    detail = str(
+                        result.metadata.get(
+                            "detail", "click completed but no post confirmation was observed"
+                        )
+                    )
+                    return ExecutionDispatchResult(
+                        DispatchOutcome.POST_NOT_CONFIRMED,
+                        self.queue.mark_unknown_external(
+                            task.id, f"UNKNOWN_EXTERNAL_STATE: {detail}"
+                        ),
+                    )
             return ExecutionDispatchResult(
                 DispatchOutcome.POST_NOT_CONFIRMED,
                 self.queue.mark_unknown_external(task.id, "POST_NOT_CONFIRMED"),
             )
         except ExternalActionUncertainError as exc:
+            if exc.action_attempted:
+                self.queue.add_event(task.id, "POST_BUTTON_CLICKED", self._submit_diagnostics(exc.diagnostics))
             return ExecutionDispatchResult(
                 DispatchOutcome.UNKNOWN_EXTERNAL_STATE,
-                self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {type(exc).__name__}"),
+                self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {exc}"),
             )
         except ExecutionGatewayError as exc:
             return self._gateway_failure(task.id, exc)
@@ -198,6 +231,25 @@ class ExecutionDispatcher:
         )
         self.queue.add_event(task_id, event, error.event_details())
         return ExecutionDispatchResult(outcome, self.queue.fail(task_id, error.task_error()))
+
+    @staticmethod
+    def _submit_diagnostics(metadata) -> dict[str, object]:
+        """Copy only bounded, content-free adapter diagnostics into audit events."""
+        allowed = {
+            "url",
+            "text_length",
+            "text_sha256",
+            "composer",
+            "post_button",
+            "post_click",
+            "post_submit_status",
+            "detail",
+        }
+        return {
+            key: value
+            for key, value in dict(metadata).items()
+            if key in allowed
+        }
 
     def reconcile_unknown_task(self, task_id, *, confirmed: bool | None):
         task = self.queue.get(task_id)

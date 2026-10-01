@@ -36,6 +36,12 @@ class _Locator:
     async def text_content(self) -> str:
         return "visible post"
 
+    async def is_visible(self) -> bool:
+        return True
+
+    async def is_enabled(self) -> bool:
+        return True
+
 
 class _Page:
     url = "https://x.com/home"
@@ -95,6 +101,18 @@ async def test_remote_control_is_profile_bound_and_invalidated_on_close(client, 
     assert snapshots.json()["result"]["items"] == [
         {"text": "visible post", "href": "/operator/status/123"}
     ]
+    for operation, expected in (
+        ("is_visible", True),
+        ("is_enabled", True),
+        ("text_content", "visible post"),
+    ):
+        result = await client.post(
+            f"/api/profiles/{first}/remote/page",
+            json={"operation": operation, "selector": "[data-testid='tweetButton']"},
+            headers=headers,
+        )
+        assert result.status_code == 200
+        assert result.json()["result"]["value"] == expected
     wrong_profile = await client.post(
         f"/api/profiles/{second}/remote/page", json={"operation": "url"}, headers=headers
     )

@@ -65,6 +65,17 @@ class ExternalExecutionResult:
 class ExternalActionUncertainError(RuntimeError):
     """A write may have reached the platform but cannot be confirmed safely."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        action_attempted: bool = False,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.action_attempted = action_attempted
+        self.diagnostics = diagnostics or {}
+
 
 class CapabilityNotSupported(NotImplementedError):
     def __init__(self, platform_name: str, capability: Capability) -> None:

@@ -116,6 +116,16 @@ class RemoteLocator:
         value = (await self._page._operate("get_attribute", selector=self._selector, value=name)).get("value")
         return str(value) if value is not None else None
 
+    async def is_visible(self) -> bool:
+        return bool((await self._page._operate("is_visible", selector=self._selector)).get("value"))
+
+    async def is_enabled(self) -> bool:
+        return bool((await self._page._operate("is_enabled", selector=self._selector)).get("value"))
+
+    async def text_content(self) -> str | None:
+        value = (await self._page._operate("text_content", selector=self._selector)).get("value")
+        return str(value) if value is not None else None
+
 
 @dataclass(frozen=True, slots=True)
 class RemoteLocatorSnapshot:

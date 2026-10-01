@@ -42,16 +42,20 @@ class RecordingXAdapter(XAdapter):
         fail_after_attempt: bool = False,
         unconfirmed_after_attempt: bool = False,
         reconciliation_result: ExternalExecutionResult | None = None,
+        submit_result: ExternalExecutionResult | None = None,
     ) -> None:
         self.executed_texts: list[str] = []
         self.fail_after_attempt = fail_after_attempt
         self.unconfirmed_after_attempt = unconfirmed_after_attempt
         self.reconciliation_result = reconciliation_result
+        self.submit_result = submit_result
         self.reconciled_texts: list[str] = []
 
     async def execute_capability(self, capability, payload, context):
         assert capability is Capability.POST
         self.executed_texts.append(str(payload["text"]))
+        if self.submit_result is not None:
+            return self.submit_result
         if self.fail_after_attempt:
             raise RuntimeError("confirmation timed out after the post attempt")
         if self.unconfirmed_after_attempt:
@@ -164,6 +168,7 @@ def _dispatcher(
     fail_after_attempt: bool = False,
     unconfirmed_after_attempt: bool = False,
     reconciliation_result: ExternalExecutionResult | None = None,
+    submit_result: ExternalExecutionResult | None = None,
     max_concurrency: int = 1,
 ):
     persona = Persona(alias="targeted execution")
@@ -188,6 +193,7 @@ def _dispatcher(
         fail_after_attempt=fail_after_attempt,
         unconfirmed_after_attempt=unconfirmed_after_attempt,
         reconciliation_result=reconciliation_result,
+        submit_result=submit_result,
     )
     registry = AdapterRegistry()
     registry.register(adapter)
@@ -274,6 +280,33 @@ async def test_unconfirmed_post_attempt_becomes_unknown_without_a_retry(database
     assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
     assert adapter.executed_texts == ["confirmed preview task"]
     assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+
+
+@pytest.mark.asyncio
+async def test_known_submit_failure_is_retryable_and_never_marked_unknown(database):
+    submit_result = ExternalExecutionResult(
+        success=False,
+        confirmed=False,
+        metadata={
+            "post_button_clicked": True,
+            "post_submit_status": "POST_SUBMIT_FAILED",
+            "detail": "composer retained text after click",
+            "text_length": 22,
+        },
+    )
+    dispatcher, queue, _, gateway, _, preview_task = _dispatcher(
+        database, submit_result=submit_result
+    )
+
+    result = await dispatcher.run_task_async(preview_task.id, "operator")
+    current = queue.get(preview_task.id)
+
+    assert result.outcome.value == "post_not_confirmed"
+    assert current is not None and current.status is TaskStatus.READY
+    assert current.last_error == "POST_SUBMIT_FAILED: composer retained text after click"
+    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+    assert "POST_BUTTON_CLICKED" in [event["event_type"] for event in queue.list_events(preview_task.id)]
+    assert "POST_SUBMIT_FAILED" in [event["event_type"] for event in queue.list_events(preview_task.id)]
 
 
 @pytest.mark.asyncio

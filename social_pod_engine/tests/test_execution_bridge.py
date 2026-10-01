@@ -222,6 +222,42 @@ def test_claim_is_atomic_and_expired_claim_is_recovered(database):
     assert queue.get(task.id).status is TaskStatus.READY
 
 
+def test_recovery_only_releases_expired_running_tasks_and_never_touches_unknown(database):
+    store, campaign, _, assignment = _seed_assignment(database)
+    bridge, queue = _bridge(database, store)
+    expired = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        approval_required=False,
+    )
+    current = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        revision=2,
+        approval_required=False,
+    )
+    unknown = bridge.create_task(
+        campaign_id=campaign.id,
+        assignment_id=assignment.id,
+        capability=Capability.READ_PROFILE,
+        revision=3,
+        approval_required=False,
+    )
+
+    claimed_at = utc_now()
+    assert queue.claim(expired.id, worker_id="expired", lease_seconds=1, now=claimed_at) is not None
+    assert queue.claim(current.id, worker_id="current", lease_seconds=60, now=claimed_at) is not None
+    assert queue.claim(unknown.id, worker_id="unknown", lease_seconds=60, now=claimed_at) is not None
+    queue.mark_unknown_external(unknown.id, "outcome needs reconciliation")
+
+    assert queue.recover_expired_claims(now=claimed_at + timedelta(seconds=2)) == 1
+    assert queue.get(expired.id).status is TaskStatus.READY
+    assert queue.get(current.id).status is TaskStatus.RUNNING
+    assert queue.get(unknown.id).status is TaskStatus.UNKNOWN_EXTERNAL_STATE
+
+
 def test_dispatcher_dry_run_returns_would_execute_without_marking_completed(database):
     store, campaign, _, assignment = _seed_assignment(database)
     bridge, queue = _bridge(database, store)

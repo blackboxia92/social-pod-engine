@@ -92,3 +92,36 @@ def test_operator_reports_a_safe_execution_error_without_raising(monkeypatch):
     assert lines[0] == "❌ No se pudo ejecutar el post"
     assert "token" not in lines[1].lower()
     assert "Ocurrió un error operativo" in lines[1]
+
+
+def test_pending_task_view_recovers_expired_claims_before_displaying_status():
+    task = SimpleNamespace(
+        id=uuid4(),
+        account_id=uuid4(),
+        capability=SimpleNamespace(value="post"),
+        status=TaskStatus.RUNNING,
+        block_reason=None,
+        revision=1,
+    )
+
+    class Queue:
+        def __init__(self) -> None:
+            self.recovery_calls = 0
+
+        def recover_expired_claims(self) -> int:
+            self.recovery_calls += 1
+            task.status = TaskStatus.READY
+            return 1
+
+        def list_tasks(self):
+            return [task]
+
+    queue = Queue()
+    lines: list[str] = []
+    runtime = SimpleNamespace(queue=queue)
+
+    XOperator(runtime, output_fn=lines.append).show_tasks(False)
+
+    assert queue.recovery_calls == 1
+    assert lines[0] == "Se recuperaron 1 tareas RUNNING con claim vencido."
+    assert " ready " in lines[1]

@@ -195,6 +195,10 @@ class XOperator:
     def show_tasks(self, unknown: bool) -> None:
         from ..campaign.models import TaskStatus
 
+        if not unknown:
+            recovered = self.runtime.queue.recover_expired_claims()
+            if recovered:
+                self.say(f"Se recuperaron {recovered} tareas RUNNING con claim vencido.")
         wanted = (
             {TaskStatus.UNKNOWN_EXTERNAL_STATE}
             if unknown

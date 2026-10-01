@@ -156,7 +156,20 @@ class XOperator:
         ):
             self.say("Publicación cancelada.")
             return
-        result = asyncio.run(self.runtime.dispatcher.run_once_async(self.runtime.config.worker_id))
+        self._execute_prepared_task(task)
+
+    def _execute_prepared_task(self, task) -> None:
+        """Execute the previewed task only, keeping operational failures in the menu flow."""
+        try:
+            result = asyncio.run(
+                self.runtime.dispatcher.run_task_async(task.id, self.runtime.config.worker_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - the operator must return to the menu
+            if os.getenv("SOCIAL_POD_DEBUG", "").lower() == "true":
+                raise
+            self.say("❌ No se pudo ejecutar el post")
+            self.say(f"Motivo: {self._safe_operational_reason(exc)}")
+            return
         current = result.task or task
         if current.status is TaskStatus.COMPLETED:
             self.say(
@@ -170,6 +183,14 @@ class XOperator:
             self.say(
                 f"❌ NO PUBLICADO\nMotivo: {current.last_error or current.block_reason or current.status.value}"
             )
+
+    @staticmethod
+    def _safe_operational_reason(exc: Exception) -> str:
+        message = str(exc).strip()
+        forbidden = ("password", "contraseña", "token", "cookie", "authorization", "credential")
+        if not message or any(term in message.lower() for term in forbidden):
+            return "Ocurrió un error operativo durante la publicación. Revisá Camoufox e intentá nuevamente."
+        return message[:500]
 
     def show_tasks(self, unknown: bool) -> None:
         from ..campaign.models import TaskStatus

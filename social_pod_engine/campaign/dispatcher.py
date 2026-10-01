@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 from ..adapters.base import Capability, ExecutionContext, ExternalExecutionResult
 from ..content.models import ContentDraftStatus
 from ..content.persistence import ContentDraftStore
@@ -44,7 +46,18 @@ class ExecutionDispatcher:
         ready = self.queue.dequeue_ready(limit=1)
         if not ready:
             return ExecutionDispatchResult(DispatchOutcome.NO_TASK)
-        claimed = self.queue.claim(ready[0].id, worker_id=worker_id, increment_attempt=False)
+        return self.run_task(ready[0].id, worker_id)
+
+    def run_task(self, task_id: UUID, worker_id: str) -> ExecutionDispatchResult:
+        """Validate exactly one queued task without performing an external write."""
+        if self.execution_enabled:
+            raise RuntimeError("use await run_task_async() for real execution")
+        requested = self.queue.get(task_id)
+        if requested is None:
+            return ExecutionDispatchResult(DispatchOutcome.NO_TASK)
+        if requested.status is not TaskStatus.READY:
+            return ExecutionDispatchResult(DispatchOutcome.NOT_READY, requested)
+        claimed = self.queue.claim(task_id, worker_id=worker_id, increment_attempt=False)
         if claimed is None:
             return ExecutionDispatchResult(DispatchOutcome.CLAIM_LOST)
         account = self.database.get_social_account(claimed.account_id)
@@ -70,7 +83,18 @@ class ExecutionDispatcher:
         ready = self.queue.dequeue_ready(limit=1)
         if not ready:
             return ExecutionDispatchResult(DispatchOutcome.NO_TASK)
-        task = self.queue.claim(ready[0].id, worker_id=worker_id)
+        return await self.run_task_async(ready[0].id, worker_id)
+
+    async def run_task_async(self, task_id: UUID, worker_id: str) -> ExecutionDispatchResult:
+        """Run one explicit task, never selecting another READY task as a fallback."""
+        if not self.execution_enabled:
+            return self.run_task(task_id, worker_id)
+        requested = self.queue.get(task_id)
+        if requested is None:
+            return ExecutionDispatchResult(DispatchOutcome.NO_TASK)
+        if requested.status is not TaskStatus.READY:
+            return ExecutionDispatchResult(DispatchOutcome.NOT_READY, requested)
+        task = self.queue.claim(task_id, worker_id=worker_id)
         if task is None:
             return ExecutionDispatchResult(DispatchOutcome.CLAIM_LOST)
         account = self.database.get_social_account(task.account_id)

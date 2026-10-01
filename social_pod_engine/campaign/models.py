@@ -55,6 +55,7 @@ class DispatchOutcome(str, Enum):
     """Operational result of the current dry-run dispatcher pass."""
 
     NO_TASK = "no_task"
+    NOT_READY = "not_ready"
     CLAIM_LOST = "claim_lost"
     WOULD_EXECUTE = "would_execute"
     BLOCKED = "blocked"

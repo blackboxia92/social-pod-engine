@@ -78,7 +78,13 @@ class ExecutionTaskStore:
     _transitions = {
         TaskStatus.PLANNED: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
         TaskStatus.READY: {TaskStatus.RUNNING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
-        TaskStatus.RUNNING: {TaskStatus.READY, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.BLOCKED},
+        TaskStatus.RUNNING: {
+            TaskStatus.READY,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN_EXTERNAL_STATE,
+            TaskStatus.BLOCKED,
+        },
         TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.CANCELLED},
         TaskStatus.UNKNOWN_EXTERNAL_STATE: {TaskStatus.READY, TaskStatus.COMPLETED},
         TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.CANCELLED},

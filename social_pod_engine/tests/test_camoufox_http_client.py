@@ -132,6 +132,53 @@ async def test_remote_page_uses_only_the_profile_bound_handle():
 
 
 @pytest.mark.asyncio
+async def test_remote_page_reads_bounded_locator_snapshots_without_remote_evaluation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if request.url.path.endswith("launch-remote"):
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "type": "http_page_rpc",
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        assert payload == {
+            "operation": "locator_snapshots",
+            "selector": "article",
+            "value": None,
+            "text_selector": ".text",
+            "href_selector": "a[href*='/status/']",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "url": "https://x.com/example",
+                    "items": [{"text": "exact post", "href": "/example/status/42"}],
+                }
+            },
+        )
+
+    client = CamoufoxHttpClient(transport=_transport(handler))
+    remote = await client.launch_remote_profile("profile-1")
+    from social_pod_engine.integrations.camoufox_http import RemotePage
+
+    snapshots = await RemotePage(client, remote).locator_snapshots(
+        "article", text_selector=".text", href_selector="a[href*='/status/']"
+    )
+
+    assert [(item.text, item.href) for item in snapshots] == [("exact post", "/example/status/42")]
+
+
+@pytest.mark.asyncio
 async def test_http_errors_are_actionable_and_safe_get_retries():
     attempts = 0
 

@@ -301,6 +301,8 @@ class RemotePageOperationRequest(BaseModel):
     operation: str
     selector: str | None = None
     value: str | None = None
+    text_selector: str | None = None
+    href_selector: str | None = None
 
 
 class RemotePageOperationResponse(BaseModel):

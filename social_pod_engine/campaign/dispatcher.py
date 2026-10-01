@@ -192,6 +192,50 @@ class ExecutionDispatcher:
             return self.queue.release(task.id, event="RECONCILIATION_RESOLVED")
         return task
 
+    async def reconcile_unknown_task_async(self, task_id: UUID, worker_id: str) -> ExecutionDispatchResult:
+        """Read the profile for evidence of an UNKNOWN X POST without retrying it."""
+        task = self.queue.get(task_id)
+        if task is None or task.status is not TaskStatus.UNKNOWN_EXTERNAL_STATE:
+            raise ValueError("only unknown external tasks can be reconciled")
+        account = self.database.get_social_account(task.account_id)
+        text = task.payload.get("text")
+        if account is None or not isinstance(text, str) or not text:
+            return ExecutionDispatchResult(DispatchOutcome.UNKNOWN_EXTERNAL_STATE, task)
+        gateway = self.gateway
+        if gateway is None:
+            return ExecutionDispatchResult(DispatchOutcome.UNKNOWN_EXTERNAL_STATE, task)
+        async with self._execution_semaphore:
+            lease = browser = None
+            self.queue.add_event(task.id, "RECONCILIATION_STARTED", {"worker_id": worker_id})
+            try:
+                lease = await gateway.acquire_lease(
+                    account.upstream_profile_id or "", proxy_id=account.proxy_id
+                )
+                browser = await gateway.open_execution_browser(lease)
+                adapter = self.adapters.get("x")
+                finder = getattr(adapter, "find_published_post", None)
+                evidence = (
+                    await finder(text, browser.page) if callable(finder) else None
+                )
+                if isinstance(evidence, ExternalExecutionResult) and evidence.confirmed:
+                    self.queue.add_event(task.id, "RECONCILIATION_RESOLVED")
+                    completed = self.queue.complete_external(
+                        task.id,
+                        external_id=evidence.external_id,
+                        external_url=evidence.external_url,
+                    )
+                    return ExecutionDispatchResult(DispatchOutcome.WOULD_EXECUTE, completed)
+                return ExecutionDispatchResult(DispatchOutcome.UNKNOWN_EXTERNAL_STATE, task)
+            except ExecutionGatewayError:
+                return ExecutionDispatchResult(DispatchOutcome.UNKNOWN_EXTERNAL_STATE, task)
+            finally:
+                try:
+                    if browser is not None:
+                        await gateway.close_execution_browser(browser)
+                finally:
+                    if lease is not None:
+                        await gateway.release_lease(lease)
+
     def _approved_draft(self, task):
         if self.content_store is None:
             return None

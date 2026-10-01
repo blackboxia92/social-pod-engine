@@ -977,11 +977,25 @@ class ProfileManager:
         return await self.browser_sessions.open_remote_control(profile_id)
 
     async def remote_page_operation(
-        self, profile_id: str, handle: str, operation: str, *, selector: str | None = None, value: str | None = None
+        self,
+        profile_id: str,
+        handle: str,
+        operation: str,
+        *,
+        selector: str | None = None,
+        value: str | None = None,
+        text_selector: str | None = None,
+        href_selector: str | None = None,
     ) -> dict[str, Any]:
         """Delegate an allowlisted page operation without exposing browser internals."""
         return await self.browser_sessions.remote_page_operation(
-            profile_id, handle, operation, selector=selector, value=value
+            profile_id,
+            handle,
+            operation,
+            selector=selector,
+            value=value,
+            text_selector=text_selector,
+            href_selector=href_selector,
         )
 
     async def get_active_browsers(self) -> list[dict[str, Any]]:

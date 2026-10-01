@@ -36,21 +36,37 @@ def database(tmp_path):
 
 
 class RecordingXAdapter(XAdapter):
-    def __init__(self, *, fail_after_attempt: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_after_attempt: bool = False,
+        unconfirmed_after_attempt: bool = False,
+        reconciliation_result: ExternalExecutionResult | None = None,
+    ) -> None:
         self.executed_texts: list[str] = []
         self.fail_after_attempt = fail_after_attempt
+        self.unconfirmed_after_attempt = unconfirmed_after_attempt
+        self.reconciliation_result = reconciliation_result
+        self.reconciled_texts: list[str] = []
 
     async def execute_capability(self, capability, payload, context):
         assert capability is Capability.POST
         self.executed_texts.append(str(payload["text"]))
         if self.fail_after_attempt:
             raise RuntimeError("confirmation timed out after the post attempt")
+        if self.unconfirmed_after_attempt:
+            return ExternalExecutionResult(success=True, confirmed=False)
         return ExternalExecutionResult(
             success=True,
             confirmed=True,
             external_id="confirmed-post",
             external_url="https://x.com/example/status/confirmed-post",
         )
+
+    async def find_published_post(self, text: str, page: object):
+        del page
+        self.reconciled_texts.append(text)
+        return self.reconciliation_result
 
     async def validate_session(self, context: ExecutionContext) -> SessionStatus:
         assert context.page is not None
@@ -140,7 +156,12 @@ def _task(account: SocialAccount, *, text: str) -> tuple[ExecutionTask, UUID]:
 
 
 def _dispatcher(
-    database: SocialPodDatabase, *, fail_after_attempt: bool = False, max_concurrency: int = 1
+    database: SocialPodDatabase,
+    *,
+    fail_after_attempt: bool = False,
+    unconfirmed_after_attempt: bool = False,
+    reconciliation_result: ExternalExecutionResult | None = None,
+    max_concurrency: int = 1,
 ):
     persona = Persona(alias="targeted execution")
     account = SocialAccount(
@@ -160,7 +181,11 @@ def _dispatcher(
     queue = ExecutionTaskStore(database)
     queue.enqueue(first)
     queue.enqueue(second)
-    adapter = RecordingXAdapter(fail_after_attempt=fail_after_attempt)
+    adapter = RecordingXAdapter(
+        fail_after_attempt=fail_after_attempt,
+        unconfirmed_after_attempt=unconfirmed_after_attempt,
+        reconciliation_result=reconciliation_result,
+    )
     registry = AdapterRegistry()
     registry.register(adapter)
     gateway = FakeExecutionGateway()
@@ -204,6 +229,44 @@ async def test_targeted_execution_keeps_unknown_external_state_and_cleans_up(dat
     assert result.task is not None and result.task.status is TaskStatus.UNKNOWN_EXTERNAL_STATE
     assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
     assert adapter.executed_texts == ["confirmed preview task"]
+    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_post_attempt_becomes_unknown_without_a_retry(database):
+    dispatcher, queue, adapter, gateway, old_task, preview_task = _dispatcher(
+        database, unconfirmed_after_attempt=True
+    )
+
+    result = await dispatcher.run_task_async(preview_task.id, "operator")
+
+    assert result.task is not None and result.task.status is TaskStatus.UNKNOWN_EXTERNAL_STATE
+    assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
+    assert adapter.executed_texts == ["confirmed preview task"]
+    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_finds_the_original_post_without_executing_it_again(database):
+    evidence = ExternalExecutionResult(
+        success=True,
+        confirmed=True,
+        external_id="reconciled-post",
+        external_url="https://x.com/targeted-account/status/reconciled-post",
+    )
+    dispatcher, queue, adapter, gateway, _, preview_task = _dispatcher(
+        database, reconciliation_result=evidence
+    )
+    claimed = queue.claim(preview_task.id, worker_id="previous-worker")
+    assert claimed is not None
+    queue.mark_unknown_external(preview_task.id, "confirmation timed out")
+
+    result = await dispatcher.reconcile_unknown_task_async(preview_task.id, "reconciler")
+
+    assert result.task is not None and result.task.status is TaskStatus.COMPLETED
+    assert result.task.external_id == "reconciled-post"
+    assert adapter.executed_texts == []
+    assert adapter.reconciled_texts == ["confirmed preview task"]
     assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
 
 

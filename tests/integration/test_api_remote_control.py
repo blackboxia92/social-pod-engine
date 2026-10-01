@@ -7,6 +7,18 @@ from camoufox_pm.core.browser_session import BrowserSession
 
 
 class _Locator:
+    @property
+    def first(self) -> _Locator:
+        return self
+
+    def nth(self, index: int) -> _Locator:
+        assert index == 0
+        return self
+
+    def locator(self, selector: str) -> _Locator:
+        del selector
+        return self
+
     async def count(self) -> int:
         return 1
 
@@ -17,7 +29,12 @@ class _Locator:
         return None
 
     async def get_attribute(self, name: str) -> str | None:
-        return "/operator" if name == "href" else None
+        if name == "href":
+            return "/operator/status/123"
+        return None
+
+    async def text_content(self) -> str:
+        return "visible post"
 
 
 class _Page:
@@ -64,6 +81,20 @@ async def test_remote_control_is_profile_bound_and_invalidated_on_close(client, 
         f"/api/profiles/{first}/remote/page", json={"operation": "url"}, headers=headers
     )
     assert current.json()["result"]["url"] == "https://x.com/home"
+    snapshots = await client.post(
+        f"/api/profiles/{first}/remote/page",
+        json={
+            "operation": "locator_snapshots",
+            "selector": "article[data-testid='tweet']",
+            "text_selector": "[data-testid='tweetText']",
+            "href_selector": "a[href*='/status/']",
+        },
+        headers=headers,
+    )
+    assert snapshots.status_code == 200
+    assert snapshots.json()["result"]["items"] == [
+        {"text": "visible post", "href": "/operator/status/123"}
+    ]
     wrong_profile = await client.post(
         f"/api/profiles/{second}/remote/page", json={"operation": "url"}, headers=headers
     )

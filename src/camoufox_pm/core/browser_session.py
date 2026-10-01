@@ -348,6 +348,8 @@ class BrowserSessionManager:
         *,
         selector: str | None = None,
         value: str | None = None,
+        text_selector: str | None = None,
+        href_selector: str | None = None,
     ) -> dict[str, Any]:
         """Run a deliberately small set of page operations on the live context."""
         if self._remote_handles.get(handle) != profile_id:
@@ -364,6 +366,25 @@ class BrowserSessionManager:
                 raise RemoteControlError("goto requires a URL")
             await page.goto(value)
             return {"url": str(getattr(page, "url", ""))}
+        if operation == "locator_snapshots":
+            if not selector or not text_selector or not href_selector:
+                raise RemoteControlError(
+                    "locator_snapshots requires selector, text_selector, and href_selector"
+                )
+            containers = page.locator(selector)
+            count = min(await containers.count(), 20)
+            items = []
+            for index in range(count):
+                container = containers.nth(index)
+                text_locator = container.locator(text_selector)
+                href_locator = container.locator(href_selector)
+                if not await text_locator.count() or not await href_locator.count():
+                    continue
+                text = await text_locator.first.text_content()
+                href = await href_locator.first.get_attribute("href")
+                if text is not None and href is not None:
+                    items.append({"text": str(text), "href": str(href)})
+            return {"items": items, "url": str(getattr(page, "url", ""))}
         if not selector:
             raise RemoteControlError(f"{operation} requires a selector")
         locator = page.locator(selector)

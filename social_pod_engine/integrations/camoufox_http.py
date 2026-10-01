@@ -97,6 +97,14 @@ class RemoteLocator:
         return str(value) if value is not None else None
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteLocatorSnapshot:
+    """Visible text and link read from one bounded, remote DOM element."""
+
+    text: str
+    href: str
+
+
 class RemotePage:
     """Small Playwright-shaped proxy backed by CPM's profile-bound page RPC."""
 
@@ -109,6 +117,30 @@ class RemotePage:
 
     async def goto(self, url: str) -> None:
         await self._operate("goto", value=url)
+
+    async def locator_snapshots(
+        self, selector: str, *, text_selector: str, href_selector: str
+    ) -> list[RemoteLocatorSnapshot]:
+        result = await self._client.remote_page_operation(
+            self._remote.profile_id,
+            self._remote.handle,
+            "locator_snapshots",
+            selector=selector,
+            text_selector=text_selector,
+            href_selector=href_selector,
+        )
+        items = result.get("items")
+        if not isinstance(items, list):
+            raise CamoufoxHttpError("Camoufox returned invalid locator snapshots")
+        snapshots: list[RemoteLocatorSnapshot] = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not isinstance(item.get("href"), str):
+                raise CamoufoxHttpError("Camoufox returned invalid locator snapshot")
+            snapshots.append(RemoteLocatorSnapshot(item["text"], item["href"]))
+        url = result.get("url")
+        if isinstance(url, str):
+            self.url = url
+        return snapshots
 
     async def _operate(
         self, operation: str, *, selector: str | None = None, value: str | None = None
@@ -239,8 +271,18 @@ class CamoufoxHttpClient:
         *,
         selector: str | None = None,
         value: str | None = None,
+        text_selector: str | None = None,
+        href_selector: str | None = None,
     ) -> dict[str, Any]:
-        payload = {"operation": operation, "selector": selector, "value": value}
+        payload: dict[str, str | None] = {
+            "operation": operation,
+            "selector": selector,
+            "value": value,
+        }
+        if text_selector is not None:
+            payload["text_selector"] = text_selector
+        if href_selector is not None:
+            payload["href_selector"] = href_selector
         response = await self._request(
             "POST",
             f"{_API_PREFIX}/profiles/{profile_id}/remote/page",

@@ -415,6 +415,8 @@ async def remote_profile_page_operation(
             request.operation,
             selector=request.selector,
             value=request.value,
+            text_selector=request.text_selector,
+            href_selector=request.href_selector,
         )
         return RemotePageOperationResponse(result=result)
     except Exception as exc:

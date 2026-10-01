@@ -1,8 +1,10 @@
 """Read-only X adapter implemented against Playwright-compatible pages."""
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from time import monotonic
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from ..contracts import SocialPage
 from ..domain import HealthStatus, SessionStatus
@@ -44,6 +46,24 @@ class XAdapter(BaseSocialAdapter):
         "[data-testid='tweetButton']",
         "button[data-testid*='tweetButton']",
     )
+    _tweet_container_selector = "article[data-testid='tweet']"
+    _tweet_text_selector = "[data-testid='tweetText']"
+    _tweet_permalink_selector = "a[href*='/status/']"
+
+    def __init__(
+        self,
+        *,
+        confirmation_timeout_seconds: float = 8.0,
+        confirmation_poll_interval_seconds: float = 0.5,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        if confirmation_timeout_seconds < 0:
+            raise ValueError("confirmation_timeout_seconds must be non-negative")
+        if confirmation_poll_interval_seconds <= 0:
+            raise ValueError("confirmation_poll_interval_seconds must be positive")
+        self.confirmation_timeout_seconds = confirmation_timeout_seconds
+        self.confirmation_poll_interval_seconds = confirmation_poll_interval_seconds
+        self._sleep = sleep
 
     @property
     def platform_name(self) -> str:
@@ -158,10 +178,74 @@ class XAdapter(BaseSocialAdapter):
         if button is None:
             raise ValueError("X post button is unavailable")
         await button.click()
-        url = getattr(page, "url", "")
-        path = urlparse(url).path.strip("/").split("/")
-        external_id = path[-1] if len(path) >= 3 and path[-2] == "status" else None
-        return ExternalExecutionResult(True, bool(external_id), external_id=external_id, external_url=url or None)
+        immediate = self._status_reference(getattr(page, "url", ""))
+        if immediate is not None:
+            external_id, external_url = immediate
+            return ExternalExecutionResult(True, True, external_id=external_id, external_url=external_url)
+        confirmed = await self.find_published_post(text, page)
+        return confirmed or ExternalExecutionResult(True, False)
+
+    async def find_published_post(
+        self, text: str, page: SocialPage
+    ) -> ExternalExecutionResult | None:
+        """Read recent profile posts until the exact submitted text has evidence.
+
+        This is read-only confirmation: it never clicks the composer or retries
+        publication.  A missing item remains indeterminate because X timelines
+        can update asynchronously.
+        """
+        profile = await self.get_profile(page)
+        if not profile.handle:
+            return None
+        await page.goto(f"https://x.com/{profile.handle}")
+        deadline = monotonic() + self.confirmation_timeout_seconds
+        while True:
+            for item_text, href in await self._recent_post_snapshots(page):
+                if item_text != text:
+                    continue
+                reference = self._status_reference(href)
+                if reference is not None:
+                    external_id, external_url = reference
+                    return ExternalExecutionResult(
+                        True, True, external_id=external_id, external_url=external_url
+                    )
+            if monotonic() >= deadline:
+                return None
+            await self._sleep(
+                min(self.confirmation_poll_interval_seconds, max(0.0, deadline - monotonic()))
+            )
+
+    async def _recent_post_snapshots(self, page: SocialPage) -> list[tuple[str, str]]:
+        snapshotter = getattr(page, "locator_snapshots", None)
+        if callable(snapshotter):
+            remote_snapshots = await snapshotter(
+                self._tweet_container_selector,
+                text_selector=self._tweet_text_selector,
+                href_selector=self._tweet_permalink_selector,
+            )
+            return [(str(item.text), str(item.href)) for item in remote_snapshots]
+
+        containers: Any = page.locator(self._tweet_container_selector)
+        snapshots: list[tuple[str, str]] = []
+        for index in range(min(await containers.count(), 20)):
+            container = containers.nth(index)
+            text_locator = container.locator(self._tweet_text_selector)
+            href_locator = container.locator(self._tweet_permalink_selector)
+            if not await text_locator.count() or not await href_locator.count():
+                continue
+            item_text = await text_locator.first.text_content()
+            href = await href_locator.first.get_attribute("href")
+            if item_text is not None and href is not None:
+                snapshots.append((str(item_text), str(href)))
+        return snapshots
+
+    @staticmethod
+    def _status_reference(url: str) -> tuple[str, str] | None:
+        parsed = urlparse(url)
+        path = parsed.path.strip("/").split("/")
+        if len(path) < 3 or path[-2] != "status" or not path[-1]:
+            return None
+        return path[-1], urljoin("https://x.com", url)
 
     @staticmethod
     async def _first_locator(page: SocialPage, selectors: tuple[str, ...]) -> Any | None:

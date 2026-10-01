@@ -95,6 +95,35 @@ class FakeExecutionGateway:
         self.allow_execution = asyncio.Event()
         self.block_execution_open = False
         self.open_failure: ExecutionGatewayError | None = None
+        self.action_calls: list[dict[str, str]] = []
+        self.action_result = SimpleNamespace(
+            state="COMPLETED", confirmed=True, external_id="confirmed-post",
+            external_url="https://x.com/example/status/confirmed-post", reason=None,
+        )
+
+    async def execute_x_post(self, upstream_profile_id, *, text, idempotency_key, execution_task_id):
+        if self.open_failure is not None:
+            raise self.open_failure
+        if upstream_profile_id in self._leased_profiles:
+            return SimpleNamespace(
+                state="PROFILE_BUSY", confirmed=False, external_id=None,
+                external_url=None, reason="profile_lease_held",
+            )
+        self._leased_profiles.add(upstream_profile_id)
+        self.action_calls.append({
+            "profile_id": upstream_profile_id, "text": text,
+            "idempotency_key": idempotency_key, "execution_task_id": execution_task_id,
+        })
+        self.execution_started.set()
+        self.active_profiles.add(upstream_profile_id)
+        self.max_active_profiles = max(self.max_active_profiles, len(self.active_profiles))
+        try:
+            if self.block_execution_open:
+                await self.allow_execution.wait()
+            return self.action_result
+        finally:
+            self.active_profiles.discard(upstream_profile_id)
+            self._leased_profiles.discard(upstream_profile_id)
 
     async def acquire_lease(self, upstream_profile_id: str, *, proxy_id: str | None) -> object:
         del proxy_id
@@ -198,6 +227,17 @@ def _dispatcher(
     registry = AdapterRegistry()
     registry.register(adapter)
     gateway = FakeExecutionGateway()
+    if fail_after_attempt or unconfirmed_after_attempt:
+        gateway.action_result = SimpleNamespace(
+            state="UNKNOWN_EXTERNAL_STATE", confirmed=False, external_id=None,
+            external_url=None, reason="confirmation timed out",
+        )
+    elif submit_result is not None:
+        gateway.action_result = SimpleNamespace(
+            state=submit_result.metadata.get("post_submit_status", "PLATFORM_REJECTED"),
+            confirmed=False, external_id=None, external_url=None,
+            reason=submit_result.metadata.get("detail", "post submit failed"),
+        )
     drafts = ApprovedDrafts({first_draft: "old SAFE task", second_draft: "confirmed preview task"})
     dispatcher = ExecutionDispatcher(
         database,
@@ -220,9 +260,8 @@ async def test_targeted_execution_claims_and_executes_only_the_previewed_ready_t
     assert result.task is not None and result.task.id == preview_task.id
     assert result.task.status is TaskStatus.COMPLETED
     assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
-    assert adapter.executed_texts == ["confirmed preview task"]
-    assert gateway.acquired == ["cpm-targeted-profile"]
-    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+    assert adapter.executed_texts == []
+    assert [call["text"] for call in gateway.action_calls] == ["confirmed preview task"]
     assert "CLAIMED" not in [event["event_type"] for event in queue.list_events(old_task.id)]
     assert "CLAIMED" in [event["event_type"] for event in queue.list_events(preview_task.id)]
 
@@ -237,8 +276,8 @@ async def test_targeted_execution_keeps_unknown_external_state_and_cleans_up(dat
 
     assert result.task is not None and result.task.status is TaskStatus.UNKNOWN_EXTERNAL_STATE
     assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
-    assert adapter.executed_texts == ["confirmed preview task"]
-    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+    assert adapter.executed_texts == []
+    assert len(gateway.action_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -261,8 +300,7 @@ async def test_rpc_failure_before_adapter_execution_stays_retryable_and_keeps_sa
     assert current.last_error is not None and current.last_error.startswith("RPC_UNAVAILABLE")
     assert "operation=launch_remote_profile" in current.last_error
     assert adapter.executed_texts == []
-    assert gateway.closed == []
-    assert len(gateway.released) == 1
+    assert gateway.action_calls == []
     events = queue.list_events(preview_task.id)
     rpc_event = next(event for event in events if event["event_type"] == "EXECUTION_RPC_FAILED")
     assert rpc_event["details"]["exception_type"] == "ReadTimeout"
@@ -278,8 +316,8 @@ async def test_unconfirmed_post_attempt_becomes_unknown_without_a_retry(database
 
     assert result.task is not None and result.task.status is TaskStatus.UNKNOWN_EXTERNAL_STATE
     assert queue.get(old_task.id).status is TaskStatus.READY  # type: ignore[union-attr]
-    assert adapter.executed_texts == ["confirmed preview task"]
-    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
+    assert adapter.executed_texts == []
+    assert len(gateway.action_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -304,9 +342,8 @@ async def test_known_submit_failure_is_retryable_and_never_marked_unknown(databa
     assert result.outcome.value == "post_not_confirmed"
     assert current is not None and current.status is TaskStatus.READY
     assert current.last_error == "POST_SUBMIT_FAILED: composer retained text after click"
-    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 1
-    assert "POST_BUTTON_CLICKED" in [event["event_type"] for event in queue.list_events(preview_task.id)]
-    assert "POST_SUBMIT_FAILED" in [event["event_type"] for event in queue.list_events(preview_task.id)]
+    assert len(gateway.action_calls) == 1
+    assert "EXECUTION_FAILED" in [event["event_type"] for event in queue.list_events(preview_task.id)]
 
 
 @pytest.mark.asyncio
@@ -342,10 +379,8 @@ async def test_same_profile_reopens_headless_after_cleanup_and_keeps_session(dat
 
     assert first_result.task is not None and first_result.task.status is TaskStatus.COMPLETED
     assert second_result.task is not None and second_result.task.status is TaskStatus.COMPLETED
-    assert gateway.acquired == ["cpm-targeted-profile", "cpm-targeted-profile"]
-    assert len(gateway.opened) == len(gateway.closed) == len(gateway.released) == 2
+    assert [call["profile_id"] for call in gateway.action_calls] == ["cpm-targeted-profile", "cpm-targeted-profile"]
     assert gateway.active_profiles == set()
-    assert await adapter.validate_session(ExecutionContext(page=gateway.closed[-1].page)) is SessionStatus.VALID
     assert queue.get(first_task.id).status is TaskStatus.COMPLETED  # type: ignore[union-attr]
 
 
@@ -363,11 +398,10 @@ async def test_two_tasks_for_one_profile_return_profile_busy_without_second_brow
     results = await batch
 
     assert {result.outcome.value for result in results} == {"would_execute", "profile_busy"}
-    assert len(gateway.opened) == 1
-    assert len(gateway.closed) == len(gateway.released) == 1
+    assert len(gateway.action_calls) == 1
     busy_task = next(result.task for result in results if result.outcome.value == "profile_busy")
     assert busy_task is not None and busy_task.status is TaskStatus.READY
-    assert queue.get(busy_task.id).last_error == "PROFILE_BUSY | operation=unknown | detail=profile is already leased"  # type: ignore[union-attr]
+    assert queue.get(busy_task.id).last_error == "PROFILE_BUSY: profile_lease_held"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -394,14 +428,14 @@ async def test_two_profiles_can_run_with_concurrency_two(database):
         dispatcher.run_tasks_async([first_task.id, second_task.id], "parallel-worker")
     )
     await gateway.execution_started.wait()
-    while len(gateway.opened) < 2:
+    while len(gateway.action_calls) < 2:
         await asyncio.sleep(0)
     gateway.allow_execution.set()
     results = await batch
 
     assert all(result.task is not None and result.task.status is TaskStatus.COMPLETED for result in results)
     assert gateway.max_active_profiles == 2
-    assert {lease["profile"] for lease in gateway.released} == {
+    assert {call["profile_id"] for call in gateway.action_calls} == {
         "cpm-targeted-profile",
         "cpm-second-profile",
     }

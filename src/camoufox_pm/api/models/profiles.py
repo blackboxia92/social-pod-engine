@@ -280,6 +280,24 @@ class ProfileLaunchResponse(BaseModel):
     )
 
 
+class XPostActionRequest(BaseModel):
+    """Final content for CPM's one high-level X post operation."""
+
+    text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
+    idempotency_key: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+    execution_task_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
+
+
+class XPostActionResponse(BaseModel):
+    state: str
+    attempted: bool
+    confirmed: bool
+    external_id: str | None = None
+    external_url: str | None = None
+    reason: str | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
 class RemoteControlResponse(BaseModel):
     """Temporary, profile-scoped HTTP page-RPC capability."""
 

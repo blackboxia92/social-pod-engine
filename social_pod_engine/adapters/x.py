@@ -222,6 +222,10 @@ class XAdapter(BaseSocialAdapter):
         raise CapabilityNotSupported(self.platform_name, capability)
 
     async def _post(self, payload: Mapping[str, Any], page: SocialPage) -> ExternalExecutionResult:
+        # Deprecated for production writes.  The dispatcher uses CPM's single
+        # ``actions/x/post`` HTTP transaction so selectors and irreversible
+        # click/confirmation semantics cannot be split across two processes.
+        # Kept temporarily for focused adapter diagnostics and compatibility.
         text = payload.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("X POST requires non-empty final text")

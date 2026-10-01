@@ -7,8 +7,6 @@ from uuid import UUID
 
 from ..adapters.base import (
     Capability,
-    ExecutionContext,
-    ExternalActionUncertainError,
     ExternalExecutionResult,
 )
 from ..content.models import ContentDraftStatus
@@ -140,81 +138,48 @@ class ExecutionDispatcher:
             return ExecutionDispatchResult(DispatchOutcome.BLOCKED, self.queue.block(task.id, BlockReason.UNKNOWN, "external execution already confirmed"))
         gateway = self.gateway
         assert gateway is not None
-        lease = browser = None
-        attempted = False
         try:
             self.queue.add_event(task.id, "EXECUTION_STARTED")
-            lease = await gateway.acquire_lease(account.upstream_profile_id or "", proxy_id=account.proxy_id)
-            browser = await gateway.open_execution_browser(lease)
-            adapter = self.adapters.get("x")
-            attempted = True
             self.queue.add_event(task.id, "EXTERNAL_ACTION_ATTEMPTED")
-            result = await adapter.execute_capability(Capability.POST, task.payload, ExecutionContext(page=browser.page, social_account_id=str(account.id), upstream_profile_id=account.upstream_profile_id))
-            if isinstance(result, ExternalExecutionResult) and result.metadata.get("post_button_clicked"):
-                self.queue.add_event(
-                    task.id, "POST_BUTTON_CLICKED", self._submit_diagnostics(result.metadata)
+            # CPM owns the browser, authoritative profile lease, local page and
+            # every Playwright operation for this irreversible action.  Social
+            # Pod deliberately sends one high-level request, never RemotePage.
+            result = await gateway.execute_x_post(
+                account.upstream_profile_id or "",
+                text=str(task.payload["text"]),
+                idempotency_key=task.idempotency_key,
+                execution_task_id=str(task.id),
+            )
+            if result.confirmed and result.state == "COMPLETED":
+                self.queue.add_event(task.id, "EXTERNAL_ACTION_CONFIRMED")
+                return ExecutionDispatchResult(
+                    DispatchOutcome.WOULD_EXECUTE,
+                    self.queue.complete_external(task.id, external_id=result.external_id, external_url=result.external_url),
                 )
-            if isinstance(result, ExternalExecutionResult) and result.confirmed:
-                return ExecutionDispatchResult(DispatchOutcome.WOULD_EXECUTE, self.queue.complete_external(task.id, external_id=result.external_id, external_url=result.external_url))
-            if isinstance(result, ExternalExecutionResult):
-                submit_status = result.metadata.get("post_submit_status")
-                if submit_status in {
-                    "POST_SUBMIT_NOT_STARTED",
-                    "POST_SUBMIT_FAILED",
-                    "PLATFORM_REJECTED",
-                    "SESSION_EXPIRED",
-                    "CHALLENGE_REQUIRED",
-                }:
-                    detail = str(result.metadata.get("detail", "post submit failed"))
-                    self.queue.add_event(
-                        task.id, "POST_SUBMIT_FAILED", self._submit_diagnostics(result.metadata)
-                    )
-                    return ExecutionDispatchResult(
-                        DispatchOutcome.POST_NOT_CONFIRMED,
-                        self.queue.fail(task.id, f"{submit_status}: {detail}"),
-                    )
-                if submit_status == "UNKNOWN_EXTERNAL_STATE":
-                    detail = str(
-                        result.metadata.get(
-                            "detail", "click completed but no post confirmation was observed"
-                        )
-                    )
-                    return ExecutionDispatchResult(
-                        DispatchOutcome.POST_NOT_CONFIRMED,
-                        self.queue.mark_unknown_external(
-                            task.id, f"UNKNOWN_EXTERNAL_STATE: {detail}"
-                        ),
-                    )
+            reason = result.reason or result.state
+            if result.state == "UNKNOWN_EXTERNAL_STATE":
+                self.queue.add_event(task.id, "EXTERNAL_STATE_UNKNOWN")
+                return ExecutionDispatchResult(
+                    DispatchOutcome.UNKNOWN_EXTERNAL_STATE,
+                    self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {reason}"),
+                )
+            if result.state in {"PROFILE_BUSY", "MODE_CONFLICT"}:
+                self.queue.add_event(task.id, "PROFILE_BUSY", {"reason": reason})
+                return ExecutionDispatchResult(
+                    DispatchOutcome.PROFILE_BUSY, self.queue.fail(task.id, f"{result.state}: {reason}")
+                )
+            self.queue.add_event(task.id, "EXECUTION_FAILED", {"state": result.state, "reason": reason})
             return ExecutionDispatchResult(
                 DispatchOutcome.POST_NOT_CONFIRMED,
-                self.queue.mark_unknown_external(task.id, "POST_NOT_CONFIRMED"),
-            )
-        except ExternalActionUncertainError as exc:
-            if exc.action_attempted:
-                self.queue.add_event(task.id, "POST_BUTTON_CLICKED", self._submit_diagnostics(exc.diagnostics))
-            return ExecutionDispatchResult(
-                DispatchOutcome.UNKNOWN_EXTERNAL_STATE,
-                self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {exc}"),
+                self.queue.fail(task.id, f"{result.state}: {reason}"),
             )
         except ExecutionGatewayError as exc:
             return self._gateway_failure(task.id, exc)
         except Exception as exc:
-            if attempted:
-                return ExecutionDispatchResult(
-                    DispatchOutcome.UNKNOWN_EXTERNAL_STATE,
-                    self.queue.mark_unknown_external(task.id, f"UNKNOWN_EXTERNAL_STATE: {type(exc).__name__}"),
-                )
             return ExecutionDispatchResult(
                 DispatchOutcome.BROWSER_LAUNCH_FAILED,
                 self.queue.fail(task.id, f"BROWSER_LAUNCH_FAILED: {type(exc).__name__}"),
             )
-        finally:
-            try:
-                if browser is not None:
-                    await gateway.close_execution_browser(browser)
-            finally:
-                if lease is not None:
-                    await gateway.release_lease(lease)
 
     def _gateway_failure(
         self, task_id: UUID, error: ExecutionGatewayError

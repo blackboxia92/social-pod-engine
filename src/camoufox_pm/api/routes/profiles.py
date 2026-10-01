@@ -39,6 +39,8 @@ from camoufox_pm.api.models.profiles import (
     RemoteControlResponse,
     RemotePageOperationRequest,
     RemotePageOperationResponse,
+    XPostActionRequest,
+    XPostActionResponse,
 )
 from camoufox_pm.api.models.system import ApiResponse, ExcelImportData
 from camoufox_pm.core import proxy_check
@@ -48,6 +50,25 @@ from camoufox_pm.core.leases import ProfileLocked
 from camoufox_pm.core.models import BrowserSettings, ProfileStatus, ProxyConfig
 
 router = APIRouter()
+
+
+@router.post(
+    "/profiles/{profile_id}/actions/x/post",
+    response_model=XPostActionResponse,
+    operation_id="execute_x_post_action",
+    summary="Execute one confirmed X post inside CPM's persistent profile process.",
+)
+async def execute_x_post_action(profile_id: str, request: XPostActionRequest):
+    """High-level write boundary: callers never receive page handles or selectors."""
+    from camoufox_pm.actions.x_post import XPostWorker
+
+    result = await XPostWorker(get_profile_manager()).execute(
+        profile_id=profile_id,
+        text=request.text,
+        idempotency_key=request.idempotency_key,
+        execution_task_id=request.execution_task_id,
+    )
+    return XPostActionResponse(**result.to_dict())
 
 # Maps the deprecated flattened update fields onto their browser_settings keys.
 _FLATTENED_BROWSER_FIELDS = {

@@ -215,6 +215,23 @@ class DatabaseManager:
             )
         """)
 
+        # CPM's bounded idempotency receipt for irreversible high-level actions.
+        # It contains no content, cookies, browser state, or credentials.
+        self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS external_action_receipts (
+                idempotency_key TEXT PRIMARY KEY,
+                execution_task_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempted BOOLEAN NOT NULL,
+                confirmed BOOLEAN NOT NULL,
+                external_id TEXT,
+                external_url TEXT,
+                reason TEXT,
+                created_at TIMESTAMP NOT NULL
+            )
+        """)
+
         self._connection.commit()
 
     async def _create_indexes(self):
@@ -227,11 +244,46 @@ class DatabaseManager:
             "CREATE INDEX IF NOT EXISTS idx_usage_stats_timestamp ON usage_stats(timestamp)",
             "CREATE INDEX IF NOT EXISTS idx_schedules_profile ON schedules(profile_id)",
             "CREATE INDEX IF NOT EXISTS idx_schedule_runs_schedule ON schedule_runs(schedule_id)",
+            "CREATE INDEX IF NOT EXISTS idx_external_action_receipts_task ON external_action_receipts(execution_task_id)",
         ]
 
         for index_sql in indexes:
             self._connection.execute(index_sql)
 
+        self._connection.commit()
+
+    async def get_external_action_receipt(self, idempotency_key: str) -> dict | None:
+        row = self._connection.execute(
+            "SELECT * FROM external_action_receipts WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    async def save_external_action_receipt(
+        self,
+        *,
+        idempotency_key: str,
+        execution_task_id: str,
+        profile_id: str,
+        state: str,
+        attempted: bool,
+        confirmed: bool,
+        external_id: str | None,
+        external_url: str | None,
+        reason: str | None,
+        created_at: datetime,
+    ) -> None:
+        self._connection.execute(
+            """INSERT INTO external_action_receipts
+               (idempotency_key, execution_task_id, profile_id, state, attempted, confirmed,
+                external_id, external_url, reason, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(idempotency_key) DO UPDATE SET
+                state=excluded.state, attempted=excluded.attempted, confirmed=excluded.confirmed,
+                external_id=excluded.external_id, external_url=excluded.external_url,
+                reason=excluded.reason, created_at=excluded.created_at""",
+            (idempotency_key, execution_task_id, profile_id, state, attempted, confirmed,
+             external_id, external_url, reason, created_at.isoformat()),
+        )
         self._connection.commit()
 
     # --- Profiles ---
@@ -971,6 +1023,12 @@ class StorageManager:
     async def initialize(self):
         """Initialize the database."""
         await self.db.initialize()
+
+    async def get_external_action_receipt(self, idempotency_key: str) -> dict | None:
+        return await self.db.get_external_action_receipt(idempotency_key)
+
+    async def save_external_action_receipt(self, **kwargs) -> None:
+        await self.db.save_external_action_receipt(**kwargs)
 
     # Profile methods
     async def save_profile(self, profile: Profile, expected_row_version: int | None = None):

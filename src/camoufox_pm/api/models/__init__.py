@@ -19,6 +19,8 @@ from .profiles import (
     RemoteControlResponse,
     RemotePageOperationRequest,
     RemotePageOperationResponse,
+    XPostActionRequest,
+    XPostActionResponse,
 )
 from .system import (
     ApiResponse,
@@ -39,6 +41,8 @@ __all__ = [
     "RemoteControlResponse",
     "RemotePageOperationRequest",
     "RemotePageOperationResponse",
+    "XPostActionRequest",
+    "XPostActionResponse",
     "GroupCreateRequest",
     "GroupUpdateRequest",
     "GroupResponse",

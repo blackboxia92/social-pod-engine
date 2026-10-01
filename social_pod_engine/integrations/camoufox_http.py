@@ -105,6 +105,19 @@ class CamoufoxLease:
     proxy_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class CamoufoxXPostResult:
+    """Bounded result from CPM's one high-level X POST transaction."""
+
+    state: str
+    attempted: bool
+    confirmed: bool
+    external_id: str | None = None
+    external_url: str | None = None
+    reason: str | None = None
+    diagnostics: dict[str, object] | None = None
+
+
 class RemoteLocator:
     def __init__(self, page: RemotePage, selector: str) -> None:
         self._page, self._selector = page, selector
@@ -370,6 +383,31 @@ class CamoufoxHttpClient:
             process_id=_optional_int(response.get("process_id")),
         )
 
+    async def execute_x_post(
+        self, profile_id: str, *, text: str, idempotency_key: str, execution_task_id: str
+    ) -> CamoufoxXPostResult:
+        """Call CPM once; productive X POST never uses remote DOM RPC."""
+        response = await self._request(
+            "POST",
+            f"{_API_PREFIX}/profiles/{profile_id}/actions/x/post",
+            json={
+                "text": text,
+                "idempotency_key": idempotency_key,
+                "execution_task_id": execution_task_id,
+            },
+            operation="execute_x_post",
+            timeout=self._launch_timeout,
+        )
+        return CamoufoxXPostResult(
+            state=str(response.get("state", "INTERNAL_EXECUTION_ERROR")),
+            attempted=bool(response.get("attempted", False)),
+            confirmed=bool(response.get("confirmed", False)),
+            external_id=_optional_string(response.get("external_id")),
+            external_url=_optional_string(response.get("external_url")),
+            reason=_optional_string(response.get("reason")),
+            diagnostics=response.get("diagnostics") if isinstance(response.get("diagnostics"), dict) else {},
+        )
+
     async def launch_remote_profile(
         self, profile_id: str, *, headless: bool = False, window_size: str | None = None
     ) -> CamoufoxRemoteLaunch:
@@ -581,6 +619,38 @@ class CamoufoxHttpGateway:
 
     async def close_profile_browser(self, profile_id: str) -> str:
         return await self._client.close_profile_browser(profile_id)
+
+    async def execute_x_post(
+        self, profile_id: str, *, text: str, idempotency_key: str, execution_task_id: str
+    ) -> CamoufoxXPostResult:
+        """High-level CPM action; no Social Pod page proxy is involved."""
+        from ..execution.gateway import ExecutionGatewayError, ExecutionGatewayFailureKind
+
+        try:
+            return await self._client.execute_x_post(
+                profile_id, text=text, idempotency_key=idempotency_key, execution_task_id=execution_task_id
+            )
+        except CamoufoxHttpConflict as exc:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.PROFILE_BUSY,
+                "Camoufox profile is busy; retry after its current session closes",
+                operation=exc.operation, endpoint=exc.endpoint, status_code=exc.status_code,
+                exception_type=type(exc).__name__, safe_detail=exc.safe_detail,
+            ) from exc
+        except CamoufoxHttpUnavailable as exc:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.RPC_UNAVAILABLE,
+                "Camoufox X action service is unavailable",
+                operation=exc.operation, endpoint=exc.endpoint, status_code=exc.status_code,
+                exception_type=type(exc).__name__, safe_detail=exc.safe_detail,
+            ) from exc
+        except CamoufoxHttpError as exc:
+            raise ExecutionGatewayError(
+                ExecutionGatewayFailureKind.BROWSER_LAUNCH_FAILED,
+                "Camoufox could not execute the X post action",
+                operation=exc.operation, endpoint=exc.endpoint, status_code=exc.status_code,
+                exception_type=type(exc).__name__, safe_detail=exc.safe_detail,
+            ) from exc
 
     async def create_profile(self, account: Any) -> str:
         profile = await self._client.create_profile(name=account.username, group=str(account.group_id) if account.group_id else None)

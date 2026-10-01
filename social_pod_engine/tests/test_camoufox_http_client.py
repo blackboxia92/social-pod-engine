@@ -179,6 +179,69 @@ async def test_remote_page_reads_bounded_locator_snapshots_without_remote_evalua
 
 
 @pytest.mark.asyncio
+async def test_remote_page_reads_only_bounded_element_diagnostics():
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if request.url.path.endswith("launch-remote"):
+            return httpx.Response(
+                200,
+                json={
+                    "profile_id": "profile-1",
+                    "status": "launched",
+                    "message": "ok",
+                    "remote_control": {
+                        "type": "http_page_rpc",
+                        "endpoint": "/api/v1/profiles/profile-1/remote/page",
+                        "handle": "temporary-handle",
+                        "url": "https://x.com/home",
+                    },
+                },
+            )
+        assert payload == {
+            "operation": "element_snapshots",
+            "selector": "div[role='textbox']",
+            "value": None,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "url": "https://x.com/home",
+                    "items": [
+                        {
+                            "tag": "div",
+                            "role": "textbox",
+                            "data_testid": "tweetTextarea_0",
+                            "aria_label": "Post text",
+                            "contenteditable": "true",
+                            "placeholder": None,
+                            "text": "",
+                        }
+                    ],
+                }
+            },
+        )
+
+    client = CamoufoxHttpClient(transport=_transport(handler))
+    remote = await client.launch_remote_profile("profile-1")
+    from social_pod_engine.integrations.camoufox_http import RemotePage
+
+    snapshots = await RemotePage(client, remote).element_snapshots("div[role='textbox']")
+
+    assert snapshots == [
+        {
+            "tag": "div",
+            "role": "textbox",
+            "data_testid": "tweetTextarea_0",
+            "aria_label": "Post text",
+            "contenteditable": "true",
+            "placeholder": None,
+            "text": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_http_errors_are_actionable_and_safe_get_retries():
     attempts = 0
 

@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable, Mapping
+from enum import Enum
 from time import monotonic
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -21,6 +22,14 @@ from .base import (
     ExternalExecutionResult,
     HealthSignal,
 )
+
+
+class XPageState(str, Enum):
+    HOME_READY = "home_ready"
+    AUTHENTICATED_BUT_COMPOSER_MISSING = "authenticated_but_composer_missing"
+    LOGIN_PAGE = "login_page"
+    CHALLENGE_PAGE = "challenge_page"
+    UNEXPECTED_PAGE = "unexpected_page"
 
 
 class XAdapter(BaseSocialAdapter):
@@ -42,6 +51,10 @@ class XAdapter(BaseSocialAdapter):
         "[data-testid='tweetTextarea_0']",
         "[data-testid='tweetTextarea_0'][contenteditable='true']",
         "div[role='textbox'][data-testid*='tweetTextarea']",
+        # X's rendered editor is a contenteditable Draft.js surface.  This
+        # fallback is deliberately scoped to the main feed and its stable,
+        # user-facing aria label so it cannot select search or DM inputs.
+        "[data-testid='primaryColumn'] div[role='textbox'][contenteditable='true'][aria-label='Post text']",
     )
     _post_button_selectors = (
         "[data-testid='tweetButtonInline']",
@@ -53,6 +66,12 @@ class XAdapter(BaseSocialAdapter):
     _tweet_permalink_selector = "a[href*='/status/']"
     _toast_selectors = ("[data-testid='toast']", "[role='status']")
     _error_selectors = ("[data-testid='error-detail']", "[role='alert']")
+    _login_selectors = (
+        "input[name='text']",
+        "input[name='password']",
+        "[data-testid='loginButton']",
+    )
+    _composer_candidate_selector = "div[role='textbox'], [contenteditable='true']"
 
     def __init__(
         self,
@@ -61,6 +80,8 @@ class XAdapter(BaseSocialAdapter):
         confirmation_poll_interval_seconds: float = 0.5,
         submit_ready_timeout_seconds: float = 3.0,
         submit_ready_poll_interval_seconds: float = 0.2,
+        home_ready_timeout_seconds: float = 5.0,
+        home_ready_poll_interval_seconds: float = 0.2,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if confirmation_timeout_seconds < 0:
@@ -71,10 +92,16 @@ class XAdapter(BaseSocialAdapter):
             raise ValueError("submit_ready_timeout_seconds must be non-negative")
         if submit_ready_poll_interval_seconds <= 0:
             raise ValueError("submit_ready_poll_interval_seconds must be positive")
+        if home_ready_timeout_seconds < 0:
+            raise ValueError("home_ready_timeout_seconds must be non-negative")
+        if home_ready_poll_interval_seconds <= 0:
+            raise ValueError("home_ready_poll_interval_seconds must be positive")
         self.confirmation_timeout_seconds = confirmation_timeout_seconds
         self.confirmation_poll_interval_seconds = confirmation_poll_interval_seconds
         self.submit_ready_timeout_seconds = submit_ready_timeout_seconds
         self.submit_ready_poll_interval_seconds = submit_ready_poll_interval_seconds
+        self.home_ready_timeout_seconds = home_ready_timeout_seconds
+        self.home_ready_poll_interval_seconds = home_ready_poll_interval_seconds
         self._sleep = sleep
 
     @property
@@ -183,12 +210,24 @@ class XAdapter(BaseSocialAdapter):
         if not isinstance(text, str) or not text.strip():
             raise ValueError("X POST requires non-empty final text")
         diagnostics = self._diagnostics(text, page)
-        composer, composer_selector = await self._first_locator_with_selector(
-            page, self._composer_selectors
-        )
+        page_state, composer, composer_selector = await self._wait_for_home_ready(page)
+        diagnostics["url"] = str(getattr(page, "url", ""))
+        diagnostics["page_state"] = page_state.value
         if composer is None:
+            page_diagnostics = await self._page_diagnostics(page)
+            diagnostics["page_diagnostics"] = page_diagnostics
+            if page_state is XPageState.LOGIN_PAGE:
+                return self._submit_failure(
+                    "SESSION_EXPIRED", "LOGIN_REQUIRED", diagnostics
+                )
+            if page_state is XPageState.CHALLENGE_PAGE:
+                return self._submit_failure(
+                    "CHALLENGE_REQUIRED", "X requires manual verification", diagnostics
+                )
             return self._submit_failure(
-                "POST_SUBMIT_NOT_STARTED", "composer was not found", diagnostics
+                "POST_SUBMIT_NOT_STARTED",
+                self._composer_missing_detail(page_diagnostics),
+                diagnostics,
             )
         assert composer_selector is not None
         diagnostics["composer"] = await self._composer_state(composer, composer_selector, text)
@@ -293,6 +332,87 @@ class XAdapter(BaseSocialAdapter):
             await self._sleep(
                 min(self.submit_ready_poll_interval_seconds, max(0.0, deadline - monotonic()))
             )
+
+    async def _wait_for_home_ready(
+        self, page: SocialPage
+    ) -> tuple[XPageState, Any | None, str | None]:
+        """Navigate to Home and wait for a bounded, observable X page state.
+
+        A successful ``goto`` only means navigation was requested; X mounts its
+        client-side composer later.  The loop deliberately performs read-only
+        probes and never opens a compose dialog or clicks a control.
+        """
+        if urlparse(str(getattr(page, "url", ""))).path.rstrip("/").lower() != "/home":
+            await self.open_home(page)
+        deadline = monotonic() + self.home_ready_timeout_seconds
+        last_state = XPageState.UNEXPECTED_PAGE
+        while True:
+            state = await self._classify_page(page)
+            if state in (XPageState.LOGIN_PAGE, XPageState.CHALLENGE_PAGE):
+                return state, None, None
+            composer, selector = await self._first_locator_with_selector(page, self._composer_selectors)
+            if composer is not None:
+                return XPageState.HOME_READY, composer, selector
+            last_state = state
+            if monotonic() >= deadline:
+                return last_state, None, None
+            await self._sleep(
+                min(self.home_ready_poll_interval_seconds, max(0.0, deadline - monotonic()))
+            )
+
+    async def _classify_page(self, page: SocialPage) -> XPageState:
+        path = urlparse(str(getattr(page, "url", ""))).path.lower()
+        if await self._has_any(page, self._challenge_selectors):
+            return XPageState.CHALLENGE_PAGE
+        if any(token in path for token in ("/i/flow/login", "/login", "/signup")) or await self._has_any(
+            page, self._login_selectors
+        ):
+            return XPageState.LOGIN_PAGE
+        if await self._has_any(page, self._authenticated_selectors):
+            return XPageState.AUTHENTICATED_BUT_COMPOSER_MISSING
+        return XPageState.UNEXPECTED_PAGE
+
+    async def _page_diagnostics(self, page: SocialPage) -> dict[str, Any]:
+        """Collect small structural evidence only; never serialise page HTML."""
+        candidates: list[dict[str, Any]] = []
+        snapshotter = getattr(page, "element_snapshots", None)
+        if callable(snapshotter):
+            raw_candidates = await snapshotter(self._composer_candidate_selector)
+            for candidate in raw_candidates[:12]:
+                candidates.append(
+                    {
+                        key: candidate.get(key)
+                        for key in (
+                            "tag",
+                            "role",
+                            "data_testid",
+                            "aria_label",
+                            "contenteditable",
+                            "placeholder",
+                            "text",
+                        )
+                    }
+                )
+        return {
+            "url": str(getattr(page, "url", "")),
+            "authenticated": await self._has_any(page, self._authenticated_selectors),
+            "login": await self._has_any(page, self._login_selectors),
+            "challenge": await self._has_any(page, self._challenge_selectors),
+            "textboxes": await page.locator("div[role='textbox']").count(),
+            "contenteditables": await page.locator("[contenteditable='true']").count(),
+            "data_testids": await page.locator("[data-testid]").count(),
+            "composer_candidates": candidates,
+        }
+
+    @staticmethod
+    def _composer_missing_detail(diagnostics: Mapping[str, Any]) -> str:
+        return (
+            "composer not found"
+            f" | url={diagnostics.get('url', '')}"
+            f" | authenticated={diagnostics.get('authenticated', False)}"
+            f" | textboxes={diagnostics.get('textboxes', 0)}"
+            f" | contenteditables={diagnostics.get('contenteditables', 0)}"
+        )
 
     async def _post_click_state(
         self, page: SocialPage, composer: Any, text: str

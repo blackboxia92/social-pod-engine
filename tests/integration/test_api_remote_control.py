@@ -36,6 +36,18 @@ class _Locator:
     async def text_content(self) -> str:
         return "visible post"
 
+    async def evaluate(self, expression: str) -> dict[str, str | None]:
+        assert "tagName" in expression
+        return {
+            "tag": "div",
+            "role": "textbox",
+            "data_testid": "tweetTextarea_0",
+            "aria_label": "Post text",
+            "contenteditable": "true",
+            "placeholder": None,
+            "text": "visible post",
+        }
+
     async def is_visible(self) -> bool:
         return True
 
@@ -100,6 +112,23 @@ async def test_remote_control_is_profile_bound_and_invalidated_on_close(client, 
     assert snapshots.status_code == 200
     assert snapshots.json()["result"]["items"] == [
         {"text": "visible post", "href": "/operator/status/123"}
+    ]
+    element_snapshots = await client.post(
+        f"/api/profiles/{first}/remote/page",
+        json={"operation": "element_snapshots", "selector": "div[role='textbox']"},
+        headers=headers,
+    )
+    assert element_snapshots.status_code == 200
+    assert element_snapshots.json()["result"]["items"] == [
+        {
+            "tag": "div",
+            "role": "textbox",
+            "data_testid": "tweetTextarea_0",
+            "aria_label": "Post text",
+            "contenteditable": "true",
+            "placeholder": None,
+            "text": "visible post",
+        }
     ]
     for operation, expected in (
         ("is_visible", True),

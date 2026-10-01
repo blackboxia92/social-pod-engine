@@ -162,6 +162,8 @@ class ExecutionDispatcher:
                     "POST_SUBMIT_NOT_STARTED",
                     "POST_SUBMIT_FAILED",
                     "PLATFORM_REJECTED",
+                    "SESSION_EXPIRED",
+                    "CHALLENGE_REQUIRED",
                 }:
                     detail = str(result.metadata.get("detail", "post submit failed"))
                     self.queue.add_event(
@@ -244,6 +246,8 @@ class ExecutionDispatcher:
             "post_click",
             "post_submit_status",
             "detail",
+            "page_state",
+            "page_diagnostics",
         }
         return {
             key: value

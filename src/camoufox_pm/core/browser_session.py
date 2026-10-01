@@ -385,6 +385,31 @@ class BrowserSessionManager:
                 if text is not None and href is not None:
                     items.append({"text": str(text), "href": str(href)})
             return {"items": items, "url": str(getattr(page, "url", ""))}
+        if operation == "element_snapshots":
+            if not selector:
+                raise RemoteControlError("element_snapshots requires a selector")
+            locators = page.locator(selector)
+            count = min(await locators.count(), 12)
+            items = []
+            for index in range(count):
+                locator = locators.nth(index)
+                # This fixed server-side projection is deliberately the only
+                # evaluation used here.  Clients cannot send scripts, inspect
+                # arbitrary HTML, or access browser/session data.
+                snapshot = await locator.evaluate(
+                    """element => ({
+                        tag: element.tagName.toLowerCase(),
+                        role: element.getAttribute('role'),
+                        data_testid: element.getAttribute('data-testid'),
+                        aria_label: element.getAttribute('aria-label'),
+                        contenteditable: element.getAttribute('contenteditable'),
+                        placeholder: element.getAttribute('placeholder'),
+                        text: (element.innerText || '').trim().slice(0, 120),
+                    })"""
+                )
+                if isinstance(snapshot, dict):
+                    items.append(snapshot)
+            return {"items": items, "url": str(getattr(page, "url", ""))}
         if not selector:
             raise RemoteControlError(f"{operation} requires a selector")
         locator = page.locator(selector)

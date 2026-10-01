@@ -178,6 +178,45 @@ class RemotePage:
             self.url = url
         return snapshots
 
+    async def element_snapshots(self, selector: str) -> list[dict[str, str | None]]:
+        """Return a bounded allow-list of element metadata for diagnostics.
+
+        This is intentionally not a general DOM/evaluate bridge: the service
+        chooses the fixed attributes and truncates visible text server-side.
+        """
+        result = await self._operate_remote("element_snapshots", selector=selector)
+        items = result.get("items")
+        if not isinstance(items, list):
+            raise CamoufoxHttpError(
+                "Camoufox returned invalid element snapshots",
+                operation="remote_page_operation:element_snapshots",
+                endpoint=self._remote.endpoint,
+            )
+        fields = {
+            "tag",
+            "role",
+            "data_testid",
+            "aria_label",
+            "contenteditable",
+            "placeholder",
+            "text",
+        }
+        snapshots: list[dict[str, str | None]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise CamoufoxHttpError(
+                    "Camoufox returned invalid element snapshot",
+                    operation="remote_page_operation:element_snapshots",
+                    endpoint=self._remote.endpoint,
+                )
+            snapshots.append(
+                {field: str(item[field]) if item.get(field) is not None else None for field in fields}
+            )
+        url = result.get("url")
+        if isinstance(url, str):
+            self.url = url
+        return snapshots
+
     async def _operate(
         self, operation: str, *, selector: str | None = None, value: str | None = None
     ) -> dict[str, Any]:

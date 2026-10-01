@@ -11,6 +11,15 @@ class FakeLocator:
         self.page, self.selector = page, selector
 
     async def count(self) -> int:
+        if self.selector in (
+            "input[name='challenge_response']",
+            "[data-testid='ocfEnterTextTextInput']",
+            "[data-testid='ocfEnterTextNextButton']",
+            "input[name='text']",
+            "input[name='password']",
+            "[data-testid='loginButton']",
+        ):
+            return 0
         return 1
 
     async def fill(self, text: str) -> None:
@@ -50,6 +59,15 @@ class ConfirmationLocator:
         self.page, self.selector = page, selector
 
     async def count(self) -> int:
+        if self.selector in (
+            "input[name='challenge_response']",
+            "[data-testid='ocfEnterTextTextInput']",
+            "[data-testid='ocfEnterTextNextButton']",
+            "input[name='text']",
+            "input[name='password']",
+            "[data-testid='loginButton']",
+        ):
+            return 0
         if "error-detail" in self.selector or "[role='alert']" in self.selector:
             return int(self.page.error_visible)
         if "[data-testid='toast']" in self.selector or "[role='status']" in self.selector:
@@ -132,6 +150,119 @@ class ConfirmationPage:
         assert text_selector == "[data-testid='tweetText']"
         assert href_selector == "a[href*='/status/']"
         return [type("Snapshot", (), {"text": text, "href": href}) for text, href in self.snapshots]
+
+
+class DiscoveryLocator:
+    def __init__(self, page, selector: str) -> None:
+        self.page, self.selector = page, selector
+
+    async def count(self) -> int:
+        return int(self.page.matches(self.selector))
+
+    async def fill(self, text: str) -> None:
+        self.page.filled_selector = self.selector
+        self.page.text = text
+
+    async def click(self) -> None:
+        if "tweetButton" in self.selector:
+            self.page.clicks += 1
+            self.page.url = "https://x.com/operator/status/99"
+
+    async def get_attribute(self, name: str) -> str | None:
+        if name == "contenteditable" and self.page.is_composer_selector(self.selector):
+            return "true"
+        if name == "data-testid" and "tweetButton" in self.selector:
+            return "tweetButton"
+        if name == "href" and "Profile_Link" in self.selector:
+            return "/operator"
+        return None
+
+    async def is_visible(self) -> bool:
+        return bool(self.page.matches(self.selector))
+
+    async def is_enabled(self) -> bool:
+        return bool(self.page.matches(self.selector))
+
+    async def text_content(self) -> str | None:
+        return self.page.text if self.page.is_composer_selector(self.selector) else None
+
+
+class DiscoveryPage:
+    fallback_selector = (
+        "[data-testid='primaryColumn'] div[role='textbox'][contenteditable='true']"
+        "[aria-label='Post text']"
+    )
+
+    def __init__(self, *, mode: str = "fallback", delayed: bool = False) -> None:
+        self.url = "https://x.com/home" if mode != "login" else "https://x.com/i/flow/login"
+        self.mode = mode
+        self.delayed = delayed
+        self.ready = not delayed
+        self.text = ""
+        self.clicks = 0
+        self.filled_selector: str | None = None
+        self.visited: list[str] = []
+
+    async def goto(self, url: str) -> None:
+        self.url = url
+        self.visited.append(url)
+
+    def locator(self, selector: str) -> DiscoveryLocator:
+        return DiscoveryLocator(self, selector)
+
+    def is_composer_selector(self, selector: str) -> bool:
+        return selector == self.fallback_selector
+
+    def matches(self, selector: str) -> int:
+        if self.mode == "login":
+            return int(selector in ("input[name='text']", "[data-testid='loginButton']"))
+        if self.mode == "challenge":
+            return int(selector == "input[name='challenge_response']")
+        if selector == self.fallback_selector:
+            return int(self.mode == "fallback" and self.ready)
+        if selector in (
+            "[data-testid='tweetTextarea_0']",
+            "[data-testid='tweetTextarea_0'][contenteditable='true']",
+            "div[role='textbox'][data-testid*='tweetTextarea']",
+        ):
+            return 0
+        if selector in (
+            "[data-testid='SideNav_AccountSwitcher_Button']",
+            "a[data-testid='AppTabBar_Profile_Link']",
+        ):
+            return int(self.mode in ("fallback", "missing"))
+        if "tweetButton" in selector:
+            return int(self.mode == "fallback" and self.ready)
+        if selector == "div[role='textbox']":
+            return 2 if self.mode == "missing" else 3
+        if selector == "[contenteditable='true']":
+            return 1 if self.mode == "missing" else 2
+        if selector == "[data-testid]":
+            return 7
+        return 0
+
+    async def element_snapshots(self, selector: str):
+        assert selector == "div[role='textbox'], [contenteditable='true']"
+        return [
+            {
+                "tag": "div",
+                "role": "textbox",
+                "data_testid": "SearchBox_Search_Input",
+                "aria_label": "Search query",
+                "contenteditable": "true",
+                "placeholder": "Search",
+                "text": "",
+            },
+            {
+                "tag": "div",
+                "role": "textbox",
+                "data_testid": "dmComposerTextInput",
+                "aria_label": "Message",
+                "contenteditable": "true",
+                "placeholder": "",
+                "text": "",
+            },
+        ]
 
 
 @pytest.mark.asyncio
@@ -292,3 +423,88 @@ async def test_x_post_with_ambiguous_post_click_state_does_not_click_again():
     assert result.confirmed is False
     assert result.metadata["post_submit_status"] == "UNKNOWN_EXTERNAL_STATE"
     assert page.clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_x_post_uses_the_scoped_post_text_fallback_not_another_textbox():
+    page = DiscoveryPage(mode="fallback")
+    result = await XAdapter().execute_capability(
+        Capability.POST, {"text": "Fallback composer"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.confirmed is True
+    assert page.filled_selector == DiscoveryPage.fallback_selector
+    assert page.clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_x_post_waits_for_home_composer_to_mount_before_filling():
+    page = DiscoveryPage(mode="fallback", delayed=True)
+
+    async def mount_composer(_: float) -> None:
+        page.ready = True
+
+    result = await XAdapter(
+        home_ready_timeout_seconds=1,
+        home_ready_poll_interval_seconds=0.1,
+        sleep=mount_composer,
+    ).execute_capability(Capability.POST, {"text": "Eventually ready"}, ExecutionContext(page=page))
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.confirmed is True
+    assert page.clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_x_post_navigates_to_home_before_looking_for_the_composer():
+    page = DiscoveryPage(mode="fallback")
+    page.url = "https://x.com/explore"
+    result = await XAdapter().execute_capability(
+        Capability.POST, {"text": "Return home first"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.confirmed is True
+    assert page.visited == ["https://x.com/home"]
+
+
+@pytest.mark.asyncio
+async def test_x_post_classifies_login_before_reporting_a_missing_composer():
+    page = DiscoveryPage(mode="login")
+    result = await XAdapter(home_ready_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "Never publish"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "SESSION_EXPIRED"
+    assert result.metadata["detail"] == "LOGIN_REQUIRED"
+    assert page.clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_x_post_classifies_challenge_before_reporting_a_missing_composer():
+    page = DiscoveryPage(mode="challenge")
+    result = await XAdapter(home_ready_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "Never publish"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "CHALLENGE_REQUIRED"
+    assert page.clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_x_post_reports_bounded_dom_diagnostics_when_authenticated_composer_is_missing():
+    page = DiscoveryPage(mode="missing")
+    result = await XAdapter(home_ready_timeout_seconds=0).execute_capability(
+        Capability.POST, {"text": "Never publish"}, ExecutionContext(page=page)
+    )
+
+    assert isinstance(result, ExternalExecutionResult)
+    assert result.metadata["post_submit_status"] == "POST_SUBMIT_NOT_STARTED"
+    assert "authenticated=True" in result.metadata["detail"]
+    assert "textboxes=2" in result.metadata["detail"]
+    diagnostics = result.metadata["page_diagnostics"]
+    assert diagnostics["composer_candidates"][0]["data_testid"] == "SearchBox_Search_Input"
+    assert page.clicks == 0
